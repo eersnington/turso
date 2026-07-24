@@ -1,4 +1,4 @@
-use crate::functions::validate_pg_input;
+use crate::{functions::validate_pg_input, pgvector};
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
@@ -169,6 +169,10 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_roles"
             | "pg_proc"
             | "pg_database"
+            | "pg_extension"
+            | "pg_operator"
+            | "pg_depend"
+            | "pg_range"
             | "pg_am"
             | "pg_type"
             | "pg_collation"
@@ -212,6 +216,7 @@ fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
                 || name.starts_with("pg_")
                 || name.starts_with("pragma_")
                 || name.starts_with("json_")
+                || name.starts_with("__turso_internal_")
             {
                 return false;
             }
@@ -252,6 +257,7 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
         "INET" => 869,
         "CIDR" => 650,
         "MACADDR" => 829,
+        "VECTOR" => pgvector::VECTOR_TYPE_OID,
         "OID" => 26,
         _ => 25, // default to text
     }
@@ -773,36 +779,50 @@ impl PgAttributeCursor {
             for (i, col) in columns.iter().enumerate() {
                 let col_name = col.name.clone().unwrap_or_default();
                 let type_oid = sqlite_type_to_pg_oid(&col.ty_str);
+                let is_vector = type_oid == pgvector::VECTOR_TYPE_OID;
+                let type_modifier = if is_vector {
+                    col.ty_params
+                        .first()
+                        .and_then(|expr| match expr.as_ref() {
+                            turso_parser::ast::Expr::Literal(
+                                turso_parser::ast::Literal::Numeric(value),
+                            ) => value.parse::<i64>().ok(),
+                            _ => None,
+                        })
+                        .unwrap_or(-1)
+                } else {
+                    -1
+                };
                 let attnum = (i + 1) as i64; // 1-based
                 let notnull = if col.notnull() { 1i64 } else { 0i64 };
                 let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
 
                 self.rows.push(vec![
-                    Value::from_i64(table_oid),   // attrelid
-                    Value::Text(col_name.into()), // attname
-                    Value::from_i64(type_oid),    // atttypid
-                    Value::from_i64(-1),          // attstattarget
-                    Value::from_i64(-1),          // attlen
-                    Value::from_i64(attnum),      // attnum
-                    Value::from_i64(0),           // attndims
-                    Value::from_i64(-1),          // attcacheoff
-                    Value::from_i64(-1),          // atttypmod
-                    Value::from_i64(1),           // attbyval
-                    Value::Text("p".into()),      // attstorage (plain)
-                    Value::Text("i".into()),      // attalign (int)
-                    Value::from_i64(notnull),     // attnotnull
-                    Value::from_i64(has_def),     // atthasdef
-                    Value::from_i64(0),           // atthasmissing
-                    Value::Text("".into()),       // attidentity
-                    Value::Text("".into()),       // attgenerated
-                    Value::from_i64(0),           // attisdropped
-                    Value::from_i64(1),           // attislocal
-                    Value::from_i64(0),           // attinhcount
-                    Value::from_i64(0),           // attcollation
-                    Value::Null,                  // attacl
-                    Value::Null,                  // attoptions
-                    Value::Null,                  // attfdwoptions
-                    Value::Null,                  // attmissingval
+                    Value::from_i64(table_oid),                            // attrelid
+                    Value::Text(col_name.into()),                          // attname
+                    Value::from_i64(type_oid),                             // atttypid
+                    Value::from_i64(-1),                                   // attstattarget
+                    Value::from_i64(-1),                                   // attlen
+                    Value::from_i64(attnum),                               // attnum
+                    Value::from_i64(0),                                    // attndims
+                    Value::from_i64(-1),                                   // attcacheoff
+                    Value::from_i64(type_modifier),                        // atttypmod
+                    Value::from_i64(i64::from(!is_vector)),                // attbyval
+                    Value::Text(if is_vector { "x" } else { "p" }.into()), // attstorage
+                    Value::Text("i".into()),                               // attalign (int)
+                    Value::from_i64(notnull),                              // attnotnull
+                    Value::from_i64(has_def),                              // atthasdef
+                    Value::from_i64(0),                                    // atthasmissing
+                    Value::Text("".into()),                                // attidentity
+                    Value::Text("".into()),                                // attgenerated
+                    Value::from_i64(0),                                    // attisdropped
+                    Value::from_i64(1),                                    // attislocal
+                    Value::from_i64(0),                                    // attinhcount
+                    Value::from_i64(0),                                    // attcollation
+                    Value::Null,                                           // attacl
+                    Value::Null,                                           // attoptions
+                    Value::Null,                                           // attfdwoptions
+                    Value::Null,                                           // attmissingval
                 ]);
             }
         }
@@ -1067,6 +1087,13 @@ impl PgProcCursor {
 
         // Built-in functions from the same registry as PRAGMA function_list
         for entry in Func::builtin_function_list() {
+            if matches!(
+                entry.name.as_str(),
+                "vector_distance_l2" | "vector_distance_dot" | "vector_distance_cos"
+            ) {
+                oid += 1;
+                continue;
+            }
             let prokind = match entry.func_type {
                 "a" => "a", // aggregate
                 "w" => "w", // window
@@ -1106,6 +1133,50 @@ impl PgProcCursor {
                 Value::Null,                        // proacl
             ]);
             oid += 1;
+        }
+
+        if pgvector::is_installed(&self.conn.current_schema()) {
+            for (oid, name) in [
+                (pgvector::L2_FUNCTION_OID, "vector_distance_l2"),
+                (pgvector::DOT_FUNCTION_OID, "vector_distance_dot"),
+                (pgvector::COSINE_FUNCTION_OID, "vector_distance_cos"),
+            ] {
+                self.rows.push(vec![
+                    Value::from_i64(oid),
+                    Value::build_text(name),
+                    Value::from_i64(2200),
+                    Value::from_i64(10),
+                    Value::from_i64(14),
+                    Value::from_f64(1.0),
+                    Value::from_f64(0.0),
+                    Value::from_i64(0),
+                    Value::build_text("f"),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(1),
+                    Value::from_i64(0),
+                    Value::build_text("i"),
+                    Value::build_text("u"),
+                    Value::from_i64(2),
+                    Value::from_i64(0),
+                    Value::from_i64(701),
+                    Value::build_text(format!(
+                        "{} {}",
+                        pgvector::VECTOR_TYPE_OID,
+                        pgvector::VECTOR_TYPE_OID
+                    )),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::build_text(name),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ]);
+            }
         }
 
         // Extension functions
@@ -1308,6 +1379,266 @@ impl InternalVirtualTableCursor for PgDatabaseCursor {
             Value::Null,                      // daticurules
             Value::Null,                      // datacl
         ]];
+        Ok(!self.rows.is_empty())
+    }
+}
+
+#[derive(Debug)]
+struct PgExtensionTable;
+
+impl InternalVirtualTable for PgExtensionTable {
+    fn name(&self) -> String {
+        "pg_extension".to_string()
+    }
+
+    fn open(&self, conn: Arc<Connection>) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(PgExtensionCursor {
+            conn,
+            row: None,
+            current_row: 0,
+        })))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 1.0,
+            estimated_rows: 1,
+            constraint_usages: constraints
+                .iter()
+                .map(|_| turso_ext::ConstraintUsage {
+                    argv_index: None,
+                    omit: false,
+                })
+                .collect(),
+        })
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE pg_extension (oid INTEGER, extname TEXT, extowner INTEGER, extnamespace INTEGER, extrelocatable INTEGER, extversion TEXT, extconfig TEXT, extcondition TEXT)".to_string()
+    }
+}
+
+struct PgExtensionCursor {
+    conn: Arc<Connection>,
+    row: Option<Vec<Value>>,
+    current_row: usize,
+}
+
+impl InternalVirtualTableCursor for PgExtensionCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.current_row += 1;
+        Ok(false)
+    }
+
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        Ok(self
+            .row
+            .as_ref()
+            .and_then(|row| row.get(column))
+            .cloned()
+            .unwrap_or(Value::Null))
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.current_row = 0;
+        self.row = pgvector::is_installed(&self.conn.current_schema()).then(|| {
+            vec![
+                Value::from_i64(pgvector::EXTENSION_OID),
+                Value::build_text("vector"),
+                Value::from_i64(10),
+                Value::from_i64(2200),
+                Value::from_i64(0),
+                Value::build_text(pgvector::VERSION),
+                Value::Null,
+                Value::Null,
+            ]
+        });
+        Ok(self.row.is_some())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PgvectorCatalogKind {
+    Operator,
+    Depend,
+    Range,
+}
+
+#[derive(Debug)]
+struct PgvectorCatalogTable(PgvectorCatalogKind);
+
+impl InternalVirtualTable for PgvectorCatalogTable {
+    fn name(&self) -> String {
+        match self.0 {
+            PgvectorCatalogKind::Operator => "pg_operator",
+            PgvectorCatalogKind::Depend => "pg_depend",
+            PgvectorCatalogKind::Range => "pg_range",
+        }
+        .to_string()
+    }
+
+    fn open(&self, conn: Arc<Connection>) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(PgvectorCatalogCursor {
+            conn,
+            kind: self.0,
+            rows: Vec::new(),
+            current_row: 0,
+        })))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 3.0,
+            estimated_rows: 6,
+            constraint_usages: constraints
+                .iter()
+                .map(|_| turso_ext::ConstraintUsage {
+                    argv_index: None,
+                    omit: false,
+                })
+                .collect(),
+        })
+    }
+
+    fn sql(&self) -> String {
+        match self.0 {
+            PgvectorCatalogKind::Operator => {
+                "CREATE TABLE pg_operator (
+                oid INTEGER, oprname TEXT, oprnamespace INTEGER, oprowner INTEGER,
+                oprkind TEXT, oprcanmerge INTEGER, oprcanhash INTEGER, oprleft INTEGER,
+                oprright INTEGER, oprresult INTEGER, oprcom INTEGER, oprnegate INTEGER,
+                oprcode INTEGER, oprrest INTEGER, oprjoin INTEGER
+            )"
+            }
+            PgvectorCatalogKind::Depend => {
+                "CREATE TABLE pg_depend (
+                classid INTEGER, objid INTEGER, objsubid INTEGER, refclassid INTEGER,
+                refobjid INTEGER, refobjsubid INTEGER, deptype TEXT
+            )"
+            }
+            PgvectorCatalogKind::Range => "CREATE TABLE pg_range (rngtypid OID, rngsubtype OID)",
+        }
+        .to_string()
+    }
+}
+
+struct PgvectorCatalogCursor {
+    conn: Arc<Connection>,
+    kind: PgvectorCatalogKind,
+    rows: Vec<Vec<Value>>,
+    current_row: usize,
+}
+
+impl InternalVirtualTableCursor for PgvectorCatalogCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.current_row += 1;
+        Ok(self.current_row < self.rows.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        Ok(self
+            .rows
+            .get(self.current_row)
+            .and_then(|row| row.get(column))
+            .cloned()
+            .unwrap_or(Value::Null))
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.current_row = 0;
+        self.rows.clear();
+        if !pgvector::is_installed(&self.conn.current_schema()) {
+            return Ok(false);
+        }
+        match self.kind {
+            PgvectorCatalogKind::Operator => {
+                for (oid, name, function_oid) in [
+                    (pgvector::L2_OPERATOR_OID, "<->", pgvector::L2_FUNCTION_OID),
+                    (
+                        pgvector::DOT_OPERATOR_OID,
+                        "<#>",
+                        pgvector::DOT_FUNCTION_OID,
+                    ),
+                    (
+                        pgvector::COSINE_OPERATOR_OID,
+                        "<=>",
+                        pgvector::COSINE_FUNCTION_OID,
+                    ),
+                ] {
+                    self.rows.push(vec![
+                        Value::from_i64(oid),
+                        Value::build_text(name),
+                        Value::from_i64(2200),
+                        Value::from_i64(10),
+                        Value::build_text("b"),
+                        Value::from_i64(0),
+                        Value::from_i64(0),
+                        Value::from_i64(pgvector::VECTOR_TYPE_OID),
+                        Value::from_i64(pgvector::VECTOR_TYPE_OID),
+                        Value::from_i64(701),
+                        Value::from_i64(0),
+                        Value::from_i64(0),
+                        Value::from_i64(function_oid),
+                        Value::from_i64(0),
+                        Value::from_i64(0),
+                    ]);
+                }
+            }
+            PgvectorCatalogKind::Depend => {
+                for (classid, object) in [
+                    (1247, pgvector::VECTOR_TYPE_OID),
+                    (1255, pgvector::L2_FUNCTION_OID),
+                    (1255, pgvector::DOT_FUNCTION_OID),
+                    (1255, pgvector::COSINE_FUNCTION_OID),
+                    (2617, pgvector::L2_OPERATOR_OID),
+                    (2617, pgvector::DOT_OPERATOR_OID),
+                    (2617, pgvector::COSINE_OPERATOR_OID),
+                ] {
+                    self.rows.push(vec![
+                        Value::from_i64(classid),
+                        Value::from_i64(object),
+                        Value::from_i64(0),
+                        Value::from_i64(3079),
+                        Value::from_i64(pgvector::EXTENSION_OID),
+                        Value::from_i64(0),
+                        Value::build_text("e"),
+                    ]);
+                }
+            }
+            PgvectorCatalogKind::Range => {}
+        }
         Ok(!self.rows.is_empty())
     }
 }
@@ -1935,7 +2266,7 @@ const PG_ARRAY_TYPES: &[(i64, &str, i64)] = &[
     (3807, "_jsonb", 3802),
 ];
 
-const PG_TYPE_SQL: &str = "CREATE TABLE pg_type (oid INTEGER, typname TEXT, typnamespace INTEGER, typowner INTEGER, typlen INTEGER, typbyval INTEGER, typtype TEXT, typcategory TEXT, typispreferred INTEGER, typisdefined INTEGER, typdelim TEXT, typrelid INTEGER, typsubscript TEXT, typelem INTEGER, typarray INTEGER, typinput TEXT, typoutput TEXT, typreceive TEXT, typsend TEXT, typmodin TEXT, typmodout TEXT, typanalyze TEXT, typalign TEXT, typstorage TEXT, typnotnull INTEGER, typbasetype INTEGER, typtypmod INTEGER, typndims INTEGER, typcollation INTEGER, typdefaultbin TEXT, typdefault TEXT, typacl TEXT)";
+const PG_TYPE_SQL: &str = "CREATE TABLE pg_type (oid OID, typname TEXT, typnamespace OID, typowner OID, typlen INTEGER, typbyval INTEGER, typtype INTERNAL_CHAR, typcategory INTERNAL_CHAR, typispreferred INTEGER, typisdefined INTEGER, typdelim INTERNAL_CHAR, typrelid OID, typsubscript TEXT, typelem OID, typarray OID, typinput TEXT, typoutput TEXT, typreceive TEXT, typsend TEXT, typmodin TEXT, typmodout TEXT, typanalyze TEXT, typalign INTERNAL_CHAR, typstorage INTERNAL_CHAR, typnotnull INTEGER, typbasetype OID, typtypmod INTEGER, typndims INTEGER, typcollation OID, typdefaultbin TEXT, typdefault TEXT, typacl TEXT)";
 
 #[derive(Debug)]
 pub struct PgTypeTable;
@@ -1997,10 +2328,14 @@ struct PgTypeCursor {
 
 impl PgTypeCursor {
     fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
+        Self::make_type_row_in_namespace(t, 11)
+    }
+
+    fn make_type_row_in_namespace(t: &PgTypeInfo, namespace: i64) -> Vec<Value> {
         vec![
             Value::from_i64(t.oid),                 // oid
             Value::build_text(t.name),              // typname
-            Value::from_i64(11),                    // typnamespace (pg_catalog)
+            Value::from_i64(namespace),             // typnamespace
             Value::from_i64(10),                    // typowner
             Value::from_i64(t.typlen),              // typlen
             Value::from_i64(i64::from(t.typbyval)), // typbyval
@@ -2057,8 +2392,26 @@ impl PgTypeCursor {
             }));
         }
 
-        // Dynamic: user-defined enum types from type_registry
         let schema = self.conn.current_schema();
+        if pgvector::is_installed(&schema) {
+            self.rows.push(Self::make_type_row_in_namespace(
+                &PgTypeInfo {
+                    oid: pgvector::VECTOR_TYPE_OID,
+                    name: "vector",
+                    typtype: "b",
+                    typcategory: "U",
+                    typlen: -1,
+                    typarray: 0,
+                    typelem: 0,
+                    typbyval: false,
+                    typalign: "i",
+                    typstorage: "x",
+                },
+                2200,
+            ));
+        }
+
+        // Dynamic: user-defined enum types from type_registry
         for (name, td) in &schema.type_registry {
             if td.is_builtin {
                 continue;
@@ -3016,6 +3369,48 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<VirtualTable>> {
                 Arc::new(RwLock::new(PgDatabaseTable::new())),
             )
             .expect("pg_database virtual table creation should not fail"),
+        ),
+        Arc::new(
+            VirtualTable::new_internal(
+                "pg_extension".to_string(),
+                PgExtensionTable.sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(PgExtensionTable)),
+            )
+            .expect("pg_extension virtual table creation should not fail"),
+        ),
+        Arc::new(
+            VirtualTable::new_internal(
+                "pg_operator".to_string(),
+                PgvectorCatalogTable(PgvectorCatalogKind::Operator).sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(PgvectorCatalogTable(
+                    PgvectorCatalogKind::Operator,
+                ))),
+            )
+            .expect("pg_operator virtual table creation should not fail"),
+        ),
+        Arc::new(
+            VirtualTable::new_internal(
+                "pg_depend".to_string(),
+                PgvectorCatalogTable(PgvectorCatalogKind::Depend).sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(PgvectorCatalogTable(
+                    PgvectorCatalogKind::Depend,
+                ))),
+            )
+            .expect("pg_depend virtual table creation should not fail"),
+        ),
+        Arc::new(
+            VirtualTable::new_internal(
+                "pg_range".to_string(),
+                PgvectorCatalogTable(PgvectorCatalogKind::Range).sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(PgvectorCatalogTable(
+                    PgvectorCatalogKind::Range,
+                ))),
+            )
+            .expect("pg_range virtual table creation should not fail"),
         ),
         // pg_tables virtual table
         Arc::new(

@@ -1,0 +1,133 @@
+# Native pgvector-compatible type and exact distance behavior.
+
+@database :memory:
+
+test vector-create-extension-and-roundtrip {
+    CREATE EXTENSION vector;
+    SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';
+    CREATE TABLE items (id bigint PRIMARY KEY, embedding vector(3));
+    SELECT typname FROM pg_type WHERE typname = 'vector';
+    SELECT atttypid = (SELECT oid FROM pg_type WHERE typname = 'vector'), atttypmod FROM pg_attribute
+      WHERE attrelid = (SELECT oid FROM pg_class WHERE relname = 'items')
+        AND attname = 'embedding';
+    INSERT INTO items VALUES (1, '[1,2,3]');
+    SELECT embedding FROM items;
+}
+expect {
+    vector|0.8.1
+    vector
+    1|3
+    [1,2,3]
+}
+
+test vector-requires-extension-installation {
+    CREATE TABLE items (embedding vector(3));
+}
+expect error {
+    run CREATE EXTENSION vector first
+}
+
+test vector-extension-catalog-identity {
+    CREATE EXTENSION vector;
+    SELECT extnamespace, extrelocatable FROM pg_extension WHERE extname = 'vector';
+    SELECT typnamespace, typarray FROM pg_type WHERE typname = 'vector';
+    SELECT count(*) FROM pg_tables WHERE tablename = '__turso_internal_pgvector_extension';
+    SELECT oprname FROM pg_operator
+      WHERE oprleft = (SELECT oid FROM pg_type WHERE typname = 'vector')
+      ORDER BY oprname;
+    SELECT count(*) FROM pg_depend
+      WHERE refobjid = (SELECT oid FROM pg_extension WHERE extname = 'vector')
+        AND deptype = 'e';
+}
+expect {
+    2200|0
+    2200|0
+    0
+    <#>
+    <->
+    <=>
+    7
+}
+
+test vector-installation-marker-is-not-queryable {
+    CREATE EXTENSION vector;
+    SELECT * FROM __turso_internal_pgvector_extension;
+}
+expect error {
+    no such table
+}
+
+test vector-extension-if-not-exists {
+    CREATE EXTENSION vector;
+    CREATE EXTENSION IF NOT EXISTS vector;
+    SELECT count(*) FROM pg_extension WHERE extname = 'vector';
+}
+expect {
+    1
+}
+
+test vector-invalid-dimensions {
+    CREATE EXTENSION vector;
+    CREATE TABLE items (embedding vector(0));
+}
+expect error {
+    vector dimensions must be between 1 and 16000
+}
+
+test vector-dimension-mismatch {
+    CREATE EXTENSION vector;
+    CREATE TABLE items (embedding vector(3));
+    INSERT INTO items VALUES ('[1,2]');
+}
+expect error {
+    expected 3 dimensions, not 2
+}
+
+test vector-without-dimension {
+    CREATE EXTENSION vector;
+    CREATE TABLE items (embedding vector);
+    INSERT INTO items VALUES ('[1,2]');
+    SELECT embedding FROM items;
+}
+expect {
+    [1,2]
+}
+
+test vector-null-propagation {
+    CREATE EXTENSION vector;
+    CREATE TABLE items (id bigint PRIMARY KEY, embedding vector(2));
+    INSERT INTO items VALUES (1, NULL);
+    SELECT embedding IS NULL,
+           NULL::vector IS NULL,
+           embedding <-> '[1,2]'::vector IS NULL,
+           embedding <#> '[1,2]'::vector IS NULL,
+           embedding <=> '[1,2]'::vector IS NULL
+      FROM items;
+}
+expect {
+    1|1|1|1|1
+}
+
+test vector-exact-distance-operators {
+    CREATE EXTENSION vector;
+    CREATE TABLE items (id bigint PRIMARY KEY, embedding vector(3));
+    INSERT INTO items VALUES (1, '[1,2,3]'), (2, '[-1,-2,-3]');
+    SELECT embedding <-> '[1,2,4]'::vector,
+           embedding <#> '[1,2,4]'::vector
+    FROM items WHERE id = 1;
+    SELECT id FROM items ORDER BY embedding <=> '[1,2,4]'::vector LIMIT 1;
+}
+expect {
+    1.0|-17.0
+    1
+}
+
+test vector-extension-is-transactional {
+    BEGIN;
+    CREATE EXTENSION vector;
+    ROLLBACK;
+    CREATE TABLE items (embedding vector(3));
+}
+expect error {
+    run CREATE EXTENSION vector first
+}

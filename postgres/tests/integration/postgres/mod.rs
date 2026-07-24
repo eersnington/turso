@@ -7,3 +7,4 @@ mod sequence;
 mod table;
 mod type_aliases;
 mod update_from;
+mod vector;

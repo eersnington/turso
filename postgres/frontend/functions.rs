@@ -145,6 +145,13 @@ fn exec_pg_format_type(type_oid: i64, typemod: i64) -> Value {
         2278 => "void".to_string(),
         2950 => "uuid".to_string(),
         3802 => "jsonb".to_string(),
+        crate::pgvector::VECTOR_TYPE_OID => {
+            if typemod > 0 {
+                format!("vector({typemod})")
+            } else {
+                "vector".to_string()
+            }
+        }
         _ => "unknown".to_string(),
     };
     Value::build_text(type_name)
@@ -188,6 +195,7 @@ fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
                 || name.starts_with("pg_")
                 || name.starts_with("pragma_")
                 || name.starts_with("json_")
+                || name.starts_with("__turso_internal_")
             {
                 return false;
             }

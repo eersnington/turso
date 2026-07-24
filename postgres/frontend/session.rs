@@ -7,9 +7,10 @@ use crate::catalog::{self, PostgresDialect};
 use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast;
 use turso_pg_parser::translator::{
-    is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_create_schema,
-    try_extract_drop_schema, try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PostgreSQLTranslator,
+    is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_create_extension,
+    try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
+    uses_pgvector_syntax, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
+    PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -65,6 +66,25 @@ impl PgConnection {
         &self.conn
     }
 
+    pub fn pgvector_installed(&self) -> bool {
+        crate::pgvector::is_installed(&self.conn.current_schema())
+    }
+
+    /// Resolves one-based parameter positions that need nonstandard PostgreSQL types.
+    pub fn parameter_metadata(&self, sql: &str) -> Result<crate::PgParameterMetadata> {
+        let parsed = turso_pg_parser::parse(sql)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let mut vector_parameters =
+            turso_pg_parser::translator::pgvector_parameter_indexes(&parsed);
+        infer_vector_assignment_parameters(&self.conn, &parsed, &mut vector_parameters);
+        vector_parameters.sort_unstable();
+        Ok(crate::PgParameterMetadata {
+            vector_parameters,
+            oid_parameters: turso_pg_parser::translator::oid_parameter_indexes(&parsed),
+            parameter_count: turso_pg_parser::translator::parameter_count(&parsed),
+        })
+    }
+
     pub fn prepare(&self, sql: impl AsRef<str>) -> Result<Statement> {
         prepare_statement(&self.conn, sql.as_ref())
     }
@@ -98,6 +118,101 @@ impl PgConnection {
 
     pub fn query_runner<'a>(&'a self, sql: &'a [u8]) -> PgQueryRunner<'a> {
         PgQueryRunner::new(&self.conn, sql)
+    }
+}
+
+fn infer_vector_assignment_parameters(
+    conn: &Arc<Connection>,
+    parsed: &pg_query::ParseResult,
+    vector_parameters: &mut Vec<usize>,
+) {
+    use pg_query::protobuf::node::Node;
+    use pg_query::NodeRef;
+
+    fn add_parameter(node: Option<&pg_query::protobuf::Node>, parameters: &mut Vec<usize>) {
+        let Some(Node::ParamRef(parameter)) = node.and_then(|node| node.node.as_ref()) else {
+            return;
+        };
+        let Ok(index) = usize::try_from(parameter.number) else {
+            return;
+        };
+        if index > 0 && !parameters.contains(&index) {
+            parameters.push(index);
+        }
+    }
+
+    let nodes = parsed.protobuf.nodes();
+    let Some((root, _, _, _)) = nodes.first() else {
+        return;
+    };
+    match root {
+        NodeRef::InsertStmt(insert) => {
+            let Some(relation) = &insert.relation else {
+                return;
+            };
+            let Some(table) = conn
+                .current_schema()
+                .get_table(&relation.relname)
+                .and_then(|table| table.btree())
+            else {
+                return;
+            };
+            let target_columns: Vec<_> = if insert.cols.is_empty() {
+                table.columns().iter().collect()
+            } else {
+                insert
+                    .cols
+                    .iter()
+                    .filter_map(|column| match column.node.as_ref() {
+                        Some(Node::ResTarget(target)) => {
+                            table.get_column(&target.name).map(|(_, column)| column)
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let Some(Node::SelectStmt(select)) = insert
+                .select_stmt
+                .as_deref()
+                .and_then(|select| select.node.as_ref())
+            else {
+                return;
+            };
+            for values in &select.values_lists {
+                let Some(Node::List(values)) = values.node.as_ref() else {
+                    continue;
+                };
+                for (column, value) in target_columns.iter().zip(&values.items) {
+                    if column.ty_str.eq_ignore_ascii_case("vector") {
+                        add_parameter(Some(value), vector_parameters);
+                    }
+                }
+            }
+        }
+        NodeRef::UpdateStmt(update) => {
+            let Some(relation) = &update.relation else {
+                return;
+            };
+            let Some(table) = conn
+                .current_schema()
+                .get_table(&relation.relname)
+                .and_then(|table| table.btree())
+            else {
+                return;
+            };
+            for target in &update.target_list {
+                let Some(Node::ResTarget(target)) = target.node.as_ref() else {
+                    continue;
+                };
+                let is_vector = table
+                    .get_column(&target.name)
+                    .is_some_and(|(_, column)| column.ty_str.eq_ignore_ascii_case("vector"));
+                if is_vector {
+                    add_parameter(target.val.as_deref(), vector_parameters);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -160,6 +275,24 @@ fn prepare_statement(conn: &Arc<Connection>, sql: &str) -> Result<Statement> {
 
     let parse_result =
         turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    if parse_result
+        .protobuf
+        .nodes()
+        .iter()
+        .any(|(node, _, _, _)| {
+            matches!(node, pg_query::NodeRef::RangeVar(relation) if relation.relname.starts_with("__turso_internal_"))
+        })
+    {
+        return Err(LimboError::ParseError(
+            "no such table: internal Turso catalog".to_string(),
+        ));
+    }
+    if uses_pgvector_syntax(&parse_result) && !crate::pgvector::is_installed(&conn.current_schema())
+    {
+        return Err(LimboError::ParseError(
+            "type \"vector\" does not exist; run CREATE EXTENSION vector first".to_string(),
+        ));
+    }
     let translator = PostgreSQLTranslator::new();
     let translated = translator
         .translate_with_prereqs(&parse_result)
@@ -219,6 +352,22 @@ fn try_prepare_special(conn: &Arc<Connection>, sql: &str) -> Result<Option<State
         Ok(result) => result,
         Err(_) => return Ok(None),
     };
+
+    if let Some(stmt) = try_extract_create_extension(&parse_result)
+        .map_err(|e| LimboError::ParseError(e.to_string()))?
+    {
+        let if_not_exists = if stmt.if_not_exists {
+            "IF NOT EXISTS "
+        } else {
+            ""
+        };
+        let sql = format!(
+            "CREATE TABLE {if_not_exists}{} (version TEXT NOT NULL DEFAULT '{}')",
+            crate::pgvector::INSTALLATION_MARKER,
+            crate::pgvector::VERSION,
+        );
+        return Ok(Some(conn.prepare_internal_root(sql)?));
+    }
 
     if let Some(set_stmt) = try_extract_set(&parse_result) {
         let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, set_stmt.value);

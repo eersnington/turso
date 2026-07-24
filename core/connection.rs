@@ -962,6 +962,21 @@ impl Connection {
         self.prepare_with_origin(sql, StatementOrigin::InternalHelper)
     }
 
+    /// Prepare engine-owned SQL that the caller will execute as a root
+    /// statement. The temporary nested guard permits reserved internal object
+    /// names during compilation without changing the statement's transaction
+    /// lifecycle.
+    #[doc(hidden)]
+    pub fn prepare_internal_root(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+    ) -> Result<Statement> {
+        self.start_nested();
+        let result = self.prepare_with_origin(sql, StatementOrigin::Root);
+        self.end_nested();
+        result
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn _prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self.prepare_with_origin(sql, StatementOrigin::Root)

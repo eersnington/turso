@@ -138,6 +138,7 @@ impl PostgreSQLTranslator {
             NodeRef::CreateTableAsStmt(ctas) => self.translate_create_table_as(ctas)?,
             NodeRef::CreateEnumStmt(enum_stmt) => translate_create_enum(enum_stmt)?,
             NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain)?,
+            NodeRef::CreateExtensionStmt(extension) => translate_create_extension(extension)?,
             NodeRef::CopyStmt(_) => {
                 return Err(ParseError::ParseError(
                     "COPY is handled at the postgres frontend layer".to_string(),
@@ -334,7 +335,13 @@ impl PostgreSQLTranslator {
 
         let name = col_def.colname.clone();
         let pg_type = extract_type_name(col_def)?;
-        let typmods = extract_integer_typmods(col_def);
+        let typmods = if pg_type.eq_ignore_ascii_case("vector") {
+            extract_vector_typmods(col_def.type_name.as_ref().ok_or_else(|| {
+                ParseError::ParseError("vector type is missing its type name".to_string())
+            })?)?
+        } else {
+            extract_integer_typmods(col_def)
+        };
 
         let is_serial = is_serial_type(&pg_type);
 
@@ -736,7 +743,13 @@ impl PostgreSQLTranslator {
         let col_name = ast::Name::from_string(&col_def.colname);
 
         let pg_type = extract_type_name(col_def)?;
-        let typmods = extract_integer_typmods(col_def);
+        let typmods = if pg_type.eq_ignore_ascii_case("vector") {
+            extract_vector_typmods(col_def.type_name.as_ref().ok_or_else(|| {
+                ParseError::ParseError("vector type is missing its type name".to_string())
+            })?)?
+        } else {
+            extract_integer_typmods(col_def)
+        };
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}"))
         })?;
@@ -2013,6 +2026,27 @@ impl PostgreSQLTranslator {
                     ParseError::ParseError("TypeCast missing inner expression".into())
                 })?;
                 let expr = Box::new(self.translate_expr(arg)?);
+                if let Some(type_name) = type_cast.type_name.as_ref() {
+                    if extract_type_name_from_typename(type_name)?.eq_ignore_ascii_case("vector") {
+                        let mut args = vec![expr];
+                        for modifier in extract_vector_typmods(type_name)? {
+                            args.push(Box::new(ast::Expr::Literal(ast::Literal::Numeric(
+                                modifier.to_string(),
+                            ))));
+                        }
+                        return Ok(ast::Expr::FunctionCall {
+                            name: ast::Name::from_string("vector32"),
+                            distinctness: None,
+                            args,
+                            order_by: vec![],
+                            within_group: vec![],
+                            filter_over: ast::FunctionTail {
+                                filter_clause: None,
+                                over_clause: None,
+                            },
+                        });
+                    }
+                }
                 let type_name = type_cast
                     .type_name
                     .as_ref()
@@ -2506,6 +2540,26 @@ impl PostgreSQLTranslator {
                 "Missing right expression".to_string(),
             ));
         };
+
+        let vector_function = match op_name {
+            "<->" => Some("vector_distance_l2"),
+            "<#>" => Some("vector_distance_dot"),
+            "<=>" => Some("vector_distance_cos"),
+            _ => None,
+        };
+        if let Some(name) = vector_function {
+            return Ok(ast::Expr::FunctionCall {
+                name: ast::Name::from_string(name),
+                distinctness: None,
+                args: vec![left, right],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            });
+        }
 
         // Handle regex operators (~, !~) which map to REGEXP expressions
         match op_name {
@@ -3852,8 +3906,14 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         | "REGCONFIG" | "REGDICTIONARY" | "REGNAMESPACE" | "REGROLE" => "INTEGER".into(),
         "VOID" => "TEXT".into(),
 
-        // Unknown types pass through as-is (e.g. user-defined enums).
-        // The custom type system will validate at CREATE TABLE time.
+        "VECTOR" => {
+            return Some(PgTypeMapping::with_params(
+                pg_type.to_lowercase(),
+                params.to_vec(),
+            ));
+        }
+        // Unknown types pass through as-is (e.g. user-defined enums). Their
+        // modifiers are not preserved unless the type has explicit PG support.
         _ => pg_type.to_lowercase(),
     };
 
@@ -3862,6 +3922,269 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         array_dimensions: 0,
         type_params: vec![],
     })
+}
+
+fn translate_create_extension(
+    extension: &pg_query::protobuf::CreateExtensionStmt,
+) -> Result<ast::Stmt, ParseError> {
+    parse_create_extension(extension)?;
+    Err(ParseError::ParseError(
+        "CREATE EXTENSION must be prepared by the PostgreSQL frontend".to_string(),
+    ))
+}
+
+#[derive(Debug, Clone)]
+pub struct PgCreateExtensionStmt {
+    pub if_not_exists: bool,
+}
+
+fn parse_create_extension(
+    extension: &pg_query::protobuf::CreateExtensionStmt,
+) -> Result<PgCreateExtensionStmt, ParseError> {
+    use pg_query::NodeRef;
+
+    if !extension.extname.eq_ignore_ascii_case("vector") {
+        return Err(ParseError::ParseError(format!(
+            "extension \"{}\" is not available",
+            extension.extname
+        )));
+    }
+
+    for option in &extension.options {
+        let Some(NodeRef::DefElem(option)) = option.node.as_ref().map(|node| node.to_ref()) else {
+            return Err(ParseError::ParseError(
+                "invalid CREATE EXTENSION option".to_string(),
+            ));
+        };
+        let value = option
+            .arg
+            .as_ref()
+            .and_then(|arg| arg.node.as_ref())
+            .and_then(|arg| match arg.to_ref() {
+                NodeRef::String(value) => Some(value.sval.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                ParseError::ParseError(format!(
+                    "CREATE EXTENSION option \"{}\" requires a string value",
+                    option.defname
+                ))
+            })?;
+        match option.defname.as_str() {
+            "schema" if value.eq_ignore_ascii_case("public") => {}
+            "schema" => {
+                return Err(ParseError::ParseError(
+                    "extension \"vector\" must be installed in schema \"public\"".to_string(),
+                ));
+            }
+            "new_version" if value == "0.8.1" => {}
+            "new_version" => {
+                return Err(ParseError::ParseError(format!(
+                    "extension \"vector\" version \"{value}\" is not available"
+                )));
+            }
+            name => {
+                return Err(ParseError::ParseError(format!(
+                    "CREATE EXTENSION option \"{name}\" is not supported"
+                )));
+            }
+        }
+    }
+
+    Ok(PgCreateExtensionStmt {
+        if_not_exists: extension.if_not_exists,
+    })
+}
+
+/// Extracts and validates the supported `CREATE EXTENSION vector` form.
+pub fn try_extract_create_extension(
+    parse_result: &ParseResult,
+) -> Result<Option<PgCreateExtensionStmt>, ParseError> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some((NodeRef::CreateExtensionStmt(extension), _, _, _)) = nodes.first() else {
+        return Ok(None);
+    };
+    parse_create_extension(extension).map(Some)
+}
+
+fn is_vector_type_name(type_name: &pg_query::protobuf::TypeName) -> bool {
+    use pg_query::NodeRef;
+
+    type_name.names.iter().any(|name| {
+        matches!(name.node.as_ref().map(|node| node.to_ref()), Some(NodeRef::String(name)) if name.sval.eq_ignore_ascii_case("vector"))
+    })
+}
+
+fn is_pgvector_distance_operator(nodes: &[pg_query::protobuf::Node]) -> bool {
+    use pg_query::NodeRef;
+
+    nodes.iter().any(|name| {
+        matches!(name.node.as_ref().map(|node| node.to_ref()), Some(NodeRef::String(name)) if matches!(name.sval.as_str(), "<->" | "<#>" | "<=>"))
+    })
+}
+
+/// Reports whether a statement references the PostgreSQL vector surface.
+pub fn uses_pgvector_syntax(parse_result: &ParseResult) -> bool {
+    use pg_query::NodeRef;
+
+    parse_result
+        .protobuf
+        .nodes()
+        .iter()
+        .any(|(node, _, _, _)| match node {
+            NodeRef::CreateStmt(create) => create.table_elts.iter().any(|element| {
+                matches!(element.node.as_ref(), Some(pg_query::protobuf::node::Node::ColumnDef(column)) if column.type_name.as_ref().is_some_and(is_vector_type_name))
+            }),
+            NodeRef::TypeCast(cast) => cast.type_name.as_ref().is_some_and(is_vector_type_name),
+            NodeRef::AExpr(expr) => is_pgvector_distance_operator(&expr.name),
+            _ => false,
+        })
+}
+
+/// Returns one-based parameters explicitly used as PostgreSQL vectors.
+pub fn pgvector_parameter_indexes(parse_result: &ParseResult) -> Vec<usize> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::NodeRef;
+
+    let mut indexes = Vec::new();
+    for (node, _, _, _) in parse_result.protobuf.nodes() {
+        let mut add_parameter = |parameter: &pg_query::protobuf::ParamRef| {
+            if let Ok(index) = usize::try_from(parameter.number) {
+                if index > 0 && !indexes.contains(&index) {
+                    indexes.push(index);
+                }
+            }
+        };
+        match node {
+            NodeRef::TypeCast(cast) if cast.type_name.as_ref().is_some_and(is_vector_type_name) => {
+                if let Some(Node::ParamRef(parameter)) =
+                    cast.arg.as_deref().and_then(|arg| arg.node.as_ref())
+                {
+                    add_parameter(parameter);
+                }
+            }
+            NodeRef::AExpr(expr) if is_pgvector_distance_operator(&expr.name) => {
+                for operand in [expr.lexpr.as_deref(), expr.rexpr.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(Node::ParamRef(parameter)) = operand.node.as_ref() {
+                        add_parameter(parameter);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    indexes
+}
+
+/// Returns the largest one-based parameter number referenced by a statement.
+pub fn parameter_count(parse_result: &ParseResult) -> usize {
+    use pg_query::protobuf::node::Node;
+    use pg_query::NodeRef;
+
+    fn max_parameter(node: &pg_query::protobuf::Node) -> usize {
+        match node.node.as_ref() {
+            Some(Node::ParamRef(parameter)) => usize::try_from(parameter.number).unwrap_or(0),
+            Some(Node::TypeCast(cast)) => cast.arg.as_deref().map(max_parameter).unwrap_or(0),
+            Some(Node::AExpr(expr)) => [expr.lexpr.as_deref(), expr.rexpr.as_deref()]
+                .into_iter()
+                .flatten()
+                .map(max_parameter)
+                .max()
+                .unwrap_or(0),
+            Some(Node::List(list)) => list.items.iter().map(max_parameter).max().unwrap_or(0),
+            Some(Node::ResTarget(target)) => target.val.as_deref().map(max_parameter).unwrap_or(0),
+            Some(Node::SelectStmt(select)) => select
+                .values_lists
+                .iter()
+                .chain(&select.target_list)
+                .chain(select.where_clause.iter().map(Box::as_ref))
+                .map(max_parameter)
+                .max()
+                .unwrap_or(0),
+            Some(Node::InsertStmt(insert)) => insert
+                .select_stmt
+                .as_deref()
+                .map(max_parameter)
+                .unwrap_or(0),
+            Some(Node::UpdateStmt(update)) => update
+                .target_list
+                .iter()
+                .chain(update.where_clause.iter().map(Box::as_ref))
+                .map(max_parameter)
+                .max()
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    let visited_max = parse_result
+        .protobuf
+        .nodes()
+        .iter()
+        .filter_map(|(node, _, _, _)| match node {
+            NodeRef::ParamRef(parameter) => usize::try_from(parameter.number).ok(),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let root_max = parse_result
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|statement| statement.stmt.as_ref())
+        .map(|statement| max_parameter(statement.as_ref()))
+        .unwrap_or(0);
+    visited_max.max(root_max)
+}
+
+/// Returns one-based parameters compared directly with PostgreSQL OID columns.
+pub fn oid_parameter_indexes(parse_result: &ParseResult) -> Vec<usize> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::NodeRef;
+
+    fn is_oid_column(node: Option<&pg_query::protobuf::Node>) -> bool {
+        let Some(Node::ColumnRef(column)) = node.and_then(|node| node.node.as_ref()) else {
+            return false;
+        };
+        column.fields.iter().any(|field| {
+            matches!(field.node.as_ref(), Some(Node::String(name)) if name.sval.eq_ignore_ascii_case("oid"))
+        })
+    }
+
+    fn parameter(node: Option<&pg_query::protobuf::Node>) -> Option<usize> {
+        let Some(Node::ParamRef(parameter)) = node.and_then(|node| node.node.as_ref()) else {
+            return None;
+        };
+        usize::try_from(parameter.number)
+            .ok()
+            .filter(|index| *index > 0)
+    }
+
+    let mut indexes = Vec::new();
+    for (node, _, _, _) in parse_result.protobuf.nodes() {
+        let NodeRef::AExpr(expr) = node else {
+            continue;
+        };
+        let operands = [expr.lexpr.as_deref(), expr.rexpr.as_deref()];
+        let index = if is_oid_column(operands[0]) {
+            parameter(operands[1])
+        } else if is_oid_column(operands[1]) {
+            parameter(operands[0])
+        } else {
+            None
+        };
+        if let Some(index) = index {
+            if !indexes.contains(&index) {
+                indexes.push(index);
+            }
+        }
+    }
+    indexes
 }
 
 /// Internal DDL plan for FK constraints — used during CREATE TABLE translation.
@@ -4099,6 +4422,44 @@ fn extract_integer_typmods(col_def: &pg_query::protobuf::ColumnDef) -> Vec<i64> 
             _ => None,
         })
         .collect()
+}
+
+fn extract_vector_typmods(
+    type_name: &pg_query::protobuf::TypeName,
+) -> Result<Vec<i64>, ParseError> {
+    use pg_query::protobuf::a_const::Val;
+    use pg_query::protobuf::node::Node;
+
+    if type_name.typmods.len() > 1 {
+        return Err(ParseError::ParseError(
+            "vector type accepts at most one dimension".to_string(),
+        ));
+    }
+
+    let modifiers: Vec<i64> = type_name
+        .typmods
+        .iter()
+        .map(|node| match &node.node {
+            Some(Node::Integer(value)) => Ok(value.ival as i64),
+            Some(Node::AConst(value)) => match &value.val {
+                Some(Val::Ival(value)) => Ok(value.ival as i64),
+                _ => Err(ParseError::ParseError(
+                    "vector dimensions must be an integer".to_string(),
+                )),
+            },
+            _ => Err(ParseError::ParseError(
+                "vector dimensions must be an integer".to_string(),
+            )),
+        })
+        .collect::<Result<_, _>>()?;
+    if let Some(dimensions) = modifiers.first() {
+        if !(1..=16_000).contains(dimensions) {
+            return Err(ParseError::ParseError(format!(
+                "vector dimensions must be between 1 and 16000, got {dimensions}"
+            )));
+        }
+    }
+    Ok(modifiers)
 }
 
 fn extract_key_columns(keys: &[pg_query::protobuf::Node]) -> Result<Vec<String>, ParseError> {
@@ -4645,6 +5006,32 @@ mod tests {
             map_pg_type("SOMECUSTOMTYPE", no_params),
             Some(s("somecustomtype"))
         );
+    }
+
+    #[test]
+    fn detects_pgvector_syntax_in_columns_casts_and_operators() {
+        for sql in [
+            "CREATE TABLE items (embedding vector(3))",
+            "SELECT $1::vector",
+            "SELECT embedding <=> $1 FROM items",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            assert!(uses_pgvector_syntax(&parsed), "failed to detect {sql}");
+        }
+    }
+
+    #[test]
+    fn infers_vector_parameter_from_cast() {
+        let parsed =
+            crate::parse("SELECT id FROM items ORDER BY embedding <=> $1::vector").unwrap();
+        assert_eq!(pgvector_parameter_indexes(&parsed), vec![1]);
+    }
+
+    #[test]
+    fn infers_vector_parameter_from_distance_operator() {
+        let parsed = crate::parse("SELECT embedding <=> $2 FROM items WHERE id = $1").unwrap();
+        assert_eq!(pgvector_parameter_indexes(&parsed), vec![2]);
+        assert_eq!(parameter_count(&parsed), 2);
     }
 
     #[test]
