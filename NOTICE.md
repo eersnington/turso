@@ -63,3 +63,8 @@ This project depends on SQLAlchemy, distributed by the SQLAlchemy authors:
 
 * License: licenses/bindings/python/sqlalchemy-mit-license.md (MIT License)
 * Homepage: https://github.com/sqlalchemy/sqlalchemy
+
+This project depends on postgres-types, distributed by the rust-postgres authors:
+
+* License: licenses/postgres-types-mit-license.md (MIT License)
+* Homepage: https://github.com/sfackler/rust-postgres

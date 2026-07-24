@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -5,7 +6,8 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use futures::stream;
+use futures::{stream, Sink, SinkExt};
+use postgres_types::Kind;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::Value;
@@ -19,9 +21,14 @@ use pgwire::api::results::{
     QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
-use pgwire::api::{ClientInfo, NoopHandler, PgWireServerHandlers, Type};
+use pgwire::api::store::PortalStore;
+use pgwire::api::{
+    ClientInfo, ClientPortalStore, NoopHandler, PgWireServerHandlers, Type, DEFAULT_NAME,
+};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
+use pgwire::messages::extendedquery::{Parse, ParseComplete};
+use pgwire::messages::PgWireBackendMessage;
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
 
@@ -213,6 +220,58 @@ impl ExtendedQueryHandler for TursoPgHandler {
         self.query_parser.clone()
     }
 
+    async fn on_parse<C>(&self, client: &mut C, message: Parse) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let conn = self.conn.lock().unwrap().clone();
+        let metadata = conn
+            .parameter_metadata(&message.query)
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let declares_vector_parameter = message
+            .type_oids
+            .contains(&(turso_pg::VECTOR_TYPE_OID as u32));
+        if (declares_vector_parameter || !metadata.vector_parameters.is_empty())
+            && !conn.pgvector_installed()
+        {
+            return Err(PgWireError::UserError(Box::new(error_info(
+                "type \"vector\" does not exist; run CREATE EXTENSION vector first",
+            ))));
+        }
+        let parameter_count = message.type_oids.len().max(metadata.parameter_count);
+        let mut parameter_types = Vec::with_capacity(parameter_count);
+        for index in 0..parameter_count {
+            let oid = message.type_oids.get(index).copied().unwrap_or(0);
+            let parameter_number = index + 1;
+            let data_type = if oid == turso_pg::VECTOR_TYPE_OID as u32
+                || (oid == 0 && metadata.vector_parameters.contains(&parameter_number))
+            {
+                Some(vector_pg_type())
+            } else if oid == 0 && metadata.oid_parameters.contains(&parameter_number) {
+                Some(Type::OID)
+            } else if oid == 0 {
+                None
+            } else {
+                Type::from_oid(oid)
+            };
+            parameter_types.push(data_type);
+        }
+
+        let statement = StoredStatement::new(
+            message.name.unwrap_or_else(|| DEFAULT_NAME.to_owned()),
+            message.query,
+            parameter_types,
+        );
+        client.portal_store().put_statement(Arc::new(statement));
+        client
+            .send(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
+            .await?;
+        Ok(())
+    }
+
     async fn do_query<C>(
         &self,
         _client: &mut C,
@@ -293,6 +352,15 @@ fn build_field_info(stmt: &turso_core::Statement, format: &Format) -> Vec<FieldI
             FieldInfo::new(name, None, None, pg_type, format.format_for(i))
         })
         .collect()
+}
+
+fn vector_pg_type() -> Type {
+    Type::new(
+        "vector".to_string(),
+        turso_pg::VECTOR_TYPE_OID as u32,
+        Kind::Simple,
+        "public".to_string(),
+    )
 }
 
 /// Decide the PG wire type for a result column.
@@ -396,7 +464,11 @@ fn execute_query(
                 .get(i)
                 .map(|fi| fi.datatype().clone())
                 .unwrap_or(Type::TEXT);
-            encode_value(&mut encoder, val, &pg_type)?;
+            let format = header_clone
+                .get(i)
+                .map(FieldInfo::format)
+                .unwrap_or(FieldFormat::Text);
+            encode_value(&mut encoder, val, &pg_type, format)?;
         }
         rows.push(encoder.finish());
         Ok(())
@@ -437,7 +509,7 @@ fn bind_portal_parameters(
                     .get(i)
                     .and_then(|t| t.as_ref())
                     .unwrap_or(&Type::UNKNOWN);
-                pg_bytes_to_value(bytes, pg_type)?
+                pg_bytes_to_value(bytes, pg_type, portal.parameter_format.format_for(i))?
             }
         };
         // Portal parameter i corresponds to PostgreSQL $N where N = i + 1.
@@ -446,17 +518,34 @@ fn bind_portal_parameters(
         let idx = stmt
             .parameter_index(&pg_param_name)
             .unwrap_or_else(|| NonZero::new(i + 1).expect("parameter index must be non-zero"));
-        // Ignore bind errors: parameter index mismatches or value coercion
-        // failures surface as wire-protocol errors during the subsequent
-        // execute, with a more useful message than a generic Bind failure.
-        let _ = stmt.bind_at(idx, value);
+        stmt.bind_at(idx, value)
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
     }
     Ok(())
 }
 
-/// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
-/// Assumes text format encoding (UTF-8 string representations).
-fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
+/// Convert text parameters and supported binary PostgreSQL formats to Core values.
+fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type, format: FieldFormat) -> PgWireResult<Value> {
+    if pg_type.oid() == turso_pg::VECTOR_TYPE_OID as u32 {
+        return match format {
+            FieldFormat::Text => std::str::from_utf8(bytes)
+                .map(|text| Value::from_text(text.to_owned()))
+                .map_err(|e| {
+                    PgWireError::UserError(Box::new(error_info(&format!(
+                        "invalid UTF-8 in vector parameter: {e}"
+                    ))))
+                }),
+            FieldFormat::Binary => decode_pgvector_binary(bytes),
+        };
+    }
+    if format == FieldFormat::Binary && *pg_type == Type::OID {
+        let bytes: [u8; 4] = bytes.try_into().map_err(|_| {
+            PgWireError::UserError(Box::new(error_info(
+                "invalid binary OID parameter: expected 4 bytes",
+            )))
+        })?;
+        return Ok(Value::from_i64(i64::from(u32::from_be_bytes(bytes))));
+    }
     let text = std::str::from_utf8(bytes).map_err(|e| {
         PgWireError::UserError(Box::new(error_info(&format!(
             "invalid UTF-8 in parameter: {e}"
@@ -471,6 +560,12 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 ))))
             })?;
             Ok(Value::from_i64(i))
+        }
+        Type::OID => {
+            let oid: u32 = text.parse().map_err(|e| {
+                PgWireError::UserError(Box::new(error_info(&format!("invalid OID parameter: {e}"))))
+            })?;
+            Ok(Value::from_i64(i64::from(oid)))
         }
         Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => {
             let f: f64 = text.parse().map_err(|e| {
@@ -521,6 +616,49 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     }
 }
 
+/// Decode pgvector's big-endian header and elements into Core's little-endian BLOB.
+fn decode_pgvector_binary(bytes: &[u8]) -> PgWireResult<Value> {
+    if bytes.len() < 4 {
+        return Err(PgWireError::UserError(Box::new(error_info(
+            "invalid vector binary parameter: expected a 4-byte header",
+        ))));
+    }
+    let dimensions = usize::from(u16::from_be_bytes([bytes[0], bytes[1]]));
+    let unused = u16::from_be_bytes([bytes[2], bytes[3]]);
+    if !(turso_core::vector::MIN_DENSE_F32_DIMENSIONS
+        ..=turso_core::vector::MAX_DENSE_F32_DIMENSIONS)
+        .contains(&dimensions)
+    {
+        return Err(PgWireError::UserError(Box::new(error_info(&format!(
+            "invalid vector binary parameter: dimensions must be between 1 and 16000, got {dimensions}"
+        )))));
+    }
+    if unused != 0 {
+        return Err(PgWireError::UserError(Box::new(error_info(
+            "invalid vector binary parameter: unused header field must be zero",
+        ))));
+    }
+    let expected_len = 4 + dimensions * size_of::<f32>();
+    if bytes.len() != expected_len {
+        return Err(PgWireError::UserError(Box::new(error_info(&format!(
+            "invalid vector binary parameter: expected {expected_len} bytes, got {}",
+            bytes.len()
+        )))));
+    }
+
+    let mut blob = Vec::with_capacity(dimensions * size_of::<f32>());
+    for chunk in bytes[4..].chunks_exact(size_of::<f32>()) {
+        let value = f32::from_be_bytes(chunk.try_into().expect("chunks are exactly four bytes"));
+        if !value.is_finite() {
+            return Err(PgWireError::UserError(Box::new(error_info(
+                "invalid vector binary parameter: elements must be finite",
+            ))));
+        }
+        blob.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(Value::from_blob(blob))
+}
+
 /// Decode a hex string into bytes.
 fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
     if hex.len() % 2 != 0 {
@@ -539,7 +677,11 @@ fn encode_value(
     encoder: &mut DataRowEncoder,
     val: &Value,
     pg_type: &Type,
+    format: FieldFormat,
 ) -> turso_core::Result<()> {
+    if pg_type.oid() == turso_pg::VECTOR_TYPE_OID as u32 {
+        return encode_pgvector_value(encoder, val, format);
+    }
     match val {
         Value::Null => encoder
             .encode_field(&None::<i8>)
@@ -549,6 +691,15 @@ fn encode_value(
             if *pg_type == Type::BOOL {
                 encoder
                     .encode_field(&(*i != 0))
+                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+            } else if *pg_type == Type::OID {
+                let oid = u32::try_from(*i).map_err(|_| {
+                    turso_core::LimboError::ConversionError(format!(
+                        "OID value is out of range: {i}"
+                    ))
+                })?;
+                encoder
+                    .encode_field(&oid)
                     .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
             } else {
                 encoder
@@ -564,7 +715,16 @@ fn encode_value(
             // For TIMESTAMPTZ columns, ensure timezone info is present so clients
             // parse the value correctly (as UTC, not local time).
             // TIMESTAMP (without TZ) should NOT have timezone suffix.
-            if *pg_type == Type::TIMESTAMPTZ
+            if *pg_type == Type::CHAR {
+                let value = text.as_bytes().first().copied().ok_or_else(|| {
+                    turso_core::LimboError::ConversionError(
+                        "PostgreSQL internal char cannot be empty".to_string(),
+                    )
+                })? as i8;
+                encoder
+                    .encode_field(&value)
+                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+            } else if *pg_type == Type::TIMESTAMPTZ
                 && !text.contains('+')
                 && !text.contains('Z')
                 && !text.ends_with("-00")
@@ -598,6 +758,65 @@ fn encode_value(
     }
 }
 
+/// Encode a Core dense-f32 vector using pgvector's requested text or binary format.
+fn encode_pgvector_value(
+    encoder: &mut DataRowEncoder,
+    value: &Value,
+    format: FieldFormat,
+) -> turso_core::Result<()> {
+    if matches!(value, Value::Null) {
+        return encoder
+            .encode_field_with_type_and_format(
+                &None::<i8>,
+                &Type::TEXT,
+                format,
+                &FormatOptions::default(),
+            )
+            .map_err(|e| turso_core::LimboError::InternalError(e.to_string()));
+    }
+
+    let vector = turso_core::vector::parse_vector(value, None)?;
+    if vector.vector_type != turso_core::vector::vector_types::VectorType::Float32Dense {
+        return Err(turso_core::LimboError::ConversionError(
+            "PostgreSQL vector values must use dense float32 storage".to_string(),
+        ));
+    }
+    match format {
+        FieldFormat::Text => {
+            let text = turso_core::vector::operations::text::vector_to_text(&vector);
+            encoder
+                .encode_field_with_type_and_format(
+                    &text,
+                    &Type::TEXT,
+                    FieldFormat::Text,
+                    &FormatOptions::default(),
+                )
+                .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+        }
+        FieldFormat::Binary => {
+            let dimensions = u16::try_from(vector.dims).map_err(|_| {
+                turso_core::LimboError::ConversionError(
+                    "vector dimensions exceed PostgreSQL binary format limits".to_string(),
+                )
+            })?;
+            let mut bytes = Vec::with_capacity(4 + vector.dims * size_of::<f32>());
+            bytes.extend_from_slice(&dimensions.to_be_bytes());
+            bytes.extend_from_slice(&0u16.to_be_bytes());
+            for value in vector.as_f32_slice() {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            encoder
+                .encode_field_with_type_and_format(
+                    &bytes,
+                    &Type::BYTEA,
+                    FieldFormat::Binary,
+                    &FormatOptions::default(),
+                )
+                .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+        }
+    }
+}
+
 fn sqlite_type_to_pg_type(type_str: &str) -> Type {
     let upper = type_str.to_uppercase();
     match upper.as_str() {
@@ -619,6 +838,9 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
         "CIDR" => Type::CIDR,
         "MACADDR" => Type::MACADDR,
         "MACADDR8" => Type::MACADDR8,
+        "OID" => Type::OID,
+        "VECTOR" => vector_pg_type(),
+        "INTERNAL_CHAR" => Type::CHAR,
         _ => {
             // Handle parameterized types like varchar(50), numeric(10,2)
             if upper.starts_with("VARCHAR") || upper.starts_with("CHAR") {
@@ -657,6 +879,8 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("CREATE INDEX")
     } else if upper.starts_with("CREATE SCHEMA") {
         Tag::new("CREATE SCHEMA")
+    } else if upper.starts_with("CREATE EXTENSION") {
+        Tag::new("CREATE EXTENSION")
     } else if upper.starts_with("CREATE") {
         Tag::new("CREATE TABLE")
     } else if upper.starts_with("DROP VIEW") {
@@ -698,82 +922,255 @@ fn error_info(message: &str) -> ErrorInfo {
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct PgVector(Vec<f32>);
+
+    impl postgres_types::ToSql for PgVector {
+        fn to_sql(
+            &self,
+            ty: &Type,
+            out: &mut bytes::BytesMut,
+        ) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+            if !Self::accepts(ty) {
+                return Err("expected vector PostgreSQL type".into());
+            }
+            out.extend_from_slice(&(self.0.len() as u16).to_be_bytes());
+            out.extend_from_slice(&0u16.to_be_bytes());
+            for value in &self.0 {
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+            Ok(postgres_types::IsNull::No)
+        }
+
+        fn accepts(ty: &Type) -> bool {
+            ty.oid() == turso_pg::VECTOR_TYPE_OID as u32
+        }
+
+        postgres_types::to_sql_checked!();
+    }
+
+    impl<'a> postgres_types::FromSql<'a> for PgVector {
+        fn from_sql(
+            ty: &Type,
+            raw: &'a [u8],
+        ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+            if !Self::accepts(ty) || raw.len() < 4 {
+                return Err("invalid vector result".into());
+            }
+            let dimensions = usize::from(u16::from_be_bytes([raw[0], raw[1]]));
+            if raw[2..4] != [0, 0] || raw.len() != 4 + dimensions * size_of::<f32>() {
+                return Err("invalid vector result payload".into());
+            }
+            let values = raw[4..]
+                .chunks_exact(size_of::<f32>())
+                .map(|chunk| f32::from_be_bytes(chunk.try_into().unwrap()))
+                .collect();
+            Ok(Self(values))
+        }
+
+        fn accepts(ty: &Type) -> bool {
+            ty.oid() == turso_pg::VECTOR_TYPE_OID as u32
+        }
+    }
+
+    #[tokio::test]
+    async fn extended_protocol_round_trips_binary_vector_with_inferred_oid() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (_, database) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new().with_custom_types(true),
+        )
+        .unwrap();
+        let connection = PgConnection::new(database.connect().unwrap());
+        let server = Arc::new(TursoPgServer::new(
+            address.to_string(),
+            ":memory:".to_string(),
+            connection,
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        let server_task = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run_async().await })
+        };
+
+        let (client, connection) = loop {
+            match tokio_postgres::connect(
+                &format!("host=127.0.0.1 port={} user=test", address.port()),
+                tokio_postgres::NoTls,
+            )
+            .await
+            {
+                Ok(connected) => break connected,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+        let connection_task = tokio::spawn(connection);
+
+        client
+            .batch_execute(
+                "CREATE EXTENSION vector; CREATE TABLE items (id bigint, embedding vector(3))",
+            )
+            .await
+            .unwrap();
+        let insert = client
+            .prepare("INSERT INTO items (id, embedding) VALUES (1, $1)")
+            .await
+            .unwrap();
+        assert_eq!(insert.params()[0].oid(), turso_pg::VECTOR_TYPE_OID as u32);
+        client
+            .execute(&insert, &[&PgVector(vec![1.0, 2.0, 3.0])])
+            .await
+            .unwrap();
+
+        let select = client.prepare("SELECT embedding FROM items").await.unwrap();
+        assert_eq!(
+            select.columns()[0].type_().oid(),
+            turso_pg::VECTOR_TYPE_OID as u32
+        );
+        let row = client.query_one(&select, &[]).await.unwrap();
+        let vector: PgVector = row.get(0);
+        assert_eq!(vector.0, vec![1.0, 2.0, 3.0]);
+
+        connection_task.abort();
+        server_task.abort();
+    }
+
     #[test]
     fn test_pg_bytes_to_value_integer() {
-        let val = pg_bytes_to_value(b"42", &Type::INT4).unwrap();
+        let val = pg_bytes_to_value(b"42", &Type::INT4, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_i64(42));
 
-        let val = pg_bytes_to_value(b"-100", &Type::INT8).unwrap();
+        let val = pg_bytes_to_value(b"-100", &Type::INT8, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_i64(-100));
 
-        let val = pg_bytes_to_value(b"0", &Type::INT2).unwrap();
+        let val = pg_bytes_to_value(b"0", &Type::INT2, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_i64(0));
     }
 
     #[test]
     fn test_pg_bytes_to_value_float() {
-        let val = pg_bytes_to_value(b"3.25", &Type::FLOAT8).unwrap();
+        let val = pg_bytes_to_value(b"3.25", &Type::FLOAT8, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_f64(3.25));
 
-        let val = pg_bytes_to_value(b"-0.5", &Type::FLOAT4).unwrap();
+        let val = pg_bytes_to_value(b"-0.5", &Type::FLOAT4, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_f64(-0.5));
 
-        let val = pg_bytes_to_value(b"1.23", &Type::NUMERIC).unwrap();
+        let val = pg_bytes_to_value(b"1.23", &Type::NUMERIC, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_f64(1.23));
     }
 
     #[test]
     fn test_pg_bytes_to_value_bool() {
-        let val = pg_bytes_to_value(b"t", &Type::BOOL).unwrap();
+        let val = pg_bytes_to_value(b"t", &Type::BOOL, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_i64(1));
 
-        let val = pg_bytes_to_value(b"f", &Type::BOOL).unwrap();
+        let val = pg_bytes_to_value(b"f", &Type::BOOL, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_i64(0));
 
-        let val = pg_bytes_to_value(b"true", &Type::BOOL).unwrap();
+        let val = pg_bytes_to_value(b"true", &Type::BOOL, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_i64(1));
 
-        let val = pg_bytes_to_value(b"false", &Type::BOOL).unwrap();
+        let val = pg_bytes_to_value(b"false", &Type::BOOL, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_i64(0));
     }
 
     #[test]
     fn test_pg_bytes_to_value_text() {
-        let val = pg_bytes_to_value(b"hello world", &Type::TEXT).unwrap();
+        let val = pg_bytes_to_value(b"hello world", &Type::TEXT, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_text("hello world".to_owned()));
 
-        let val = pg_bytes_to_value(b"Alice", &Type::VARCHAR).unwrap();
+        let val = pg_bytes_to_value(b"Alice", &Type::VARCHAR, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_text("Alice".to_owned()));
     }
 
     #[test]
     fn test_pg_bytes_to_value_bytea() {
-        let val = pg_bytes_to_value(b"\\xDEADBEEF", &Type::BYTEA).unwrap();
+        let val = pg_bytes_to_value(b"\\xDEADBEEF", &Type::BYTEA, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_blob(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+    }
+
+    #[test]
+    fn pgvector_binary_parameter_converts_to_internal_dense_f32_blob() {
+        let mut bytes = vec![0, 2, 0, 0];
+        bytes.extend_from_slice(&1.5f32.to_be_bytes());
+        bytes.extend_from_slice(&(-2.0f32).to_be_bytes());
+
+        let value = pg_bytes_to_value(&bytes, &vector_pg_type(), FieldFormat::Binary).unwrap();
+        let Value::Blob(blob) = value else {
+            panic!("expected vector blob");
+        };
+        assert_eq!(
+            blob.as_slice(),
+            [1.5f32.to_le_bytes(), (-2.0f32).to_le_bytes()].concat()
+        );
+    }
+
+    #[test]
+    fn pgvector_binary_parameter_rejects_malformed_payload() {
+        let error = pg_bytes_to_value(
+            &[0, 2, 0, 0, 0, 0, 0, 0],
+            &vector_pg_type(),
+            FieldFormat::Binary,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("expected 12 bytes"));
+    }
+
+    #[test]
+    fn pgvector_binary_result_uses_pgvector_layout() {
+        let fields = Arc::new(vec![FieldInfo::new(
+            "embedding".to_string(),
+            None,
+            None,
+            vector_pg_type(),
+            FieldFormat::Binary,
+        )]);
+        let mut encoder = DataRowEncoder::new(fields);
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1.5f32.to_le_bytes());
+        blob.extend_from_slice(&(-2.0f32).to_le_bytes());
+        encode_value(
+            &mut encoder,
+            &Value::from_blob(blob),
+            &vector_pg_type(),
+            FieldFormat::Binary,
+        )
+        .unwrap();
+
+        let row = encoder.finish().unwrap();
+        assert_eq!(&row.data[..4], &12i32.to_be_bytes());
+        assert_eq!(&row.data[4..8], &[0, 2, 0, 0]);
+        assert_eq!(&row.data[8..12], &1.5f32.to_be_bytes());
+        assert_eq!(&row.data[12..16], &(-2.0f32).to_be_bytes());
     }
 
     #[test]
     fn test_pg_bytes_to_value_unknown_type_as_text() {
         // Unknown types should be treated as text
-        let val = pg_bytes_to_value(b"some-uuid-value", &Type::UUID).unwrap();
+        let val = pg_bytes_to_value(b"some-uuid-value", &Type::UUID, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_text("some-uuid-value".to_owned()));
     }
 
     #[test]
     fn test_pg_bytes_to_value_integer_parse_error() {
-        let result = pg_bytes_to_value(b"not_a_number", &Type::INT4);
+        let result = pg_bytes_to_value(b"not_a_number", &Type::INT4, FieldFormat::Text);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_pg_bytes_to_value_float_parse_error() {
-        let result = pg_bytes_to_value(b"not_a_float", &Type::FLOAT8);
+        let result = pg_bytes_to_value(b"not_a_float", &Type::FLOAT8, FieldFormat::Text);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_pg_bytes_to_value_bool_invalid() {
-        let result = pg_bytes_to_value(b"maybe", &Type::BOOL);
+        let result = pg_bytes_to_value(b"maybe", &Type::BOOL, FieldFormat::Text);
         assert!(result.is_err());
     }
 
@@ -814,14 +1211,14 @@ mod tests {
     #[test]
     fn test_unknown_type_inference() {
         // UNKNOWN type should infer integers from numeric-looking strings
-        let val = pg_bytes_to_value(b"42", &Type::UNKNOWN).unwrap();
+        let val = pg_bytes_to_value(b"42", &Type::UNKNOWN, FieldFormat::Text).unwrap();
         assert!(matches!(
             val,
             Value::Numeric(turso_core::Numeric::Integer(42))
         ));
 
         // UNKNOWN type should infer floats
-        let val = pg_bytes_to_value(b"3.14", &Type::UNKNOWN).unwrap();
+        let val = pg_bytes_to_value(b"3.14", &Type::UNKNOWN, FieldFormat::Text).unwrap();
         if let Value::Numeric(turso_core::Numeric::Float(f)) = val {
             #[allow(clippy::approx_constant)]
             let expected = 3.14;
@@ -831,7 +1228,7 @@ mod tests {
         }
 
         // UNKNOWN type should keep text for non-numeric strings
-        let val = pg_bytes_to_value(b"hello", &Type::UNKNOWN).unwrap();
+        let val = pg_bytes_to_value(b"hello", &Type::UNKNOWN, FieldFormat::Text).unwrap();
         assert!(matches!(val, Value::Text(_)));
     }
 }
