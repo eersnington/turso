@@ -696,6 +696,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             .indexes
             .values()
             .flatten()
+            .filter(|index| index.storage_kind() == crate::schema::IndexStorageKind::PhysicalBTree)
             .map(|index| {
                 turso_assert!(index.root_page != 0, "index root_page must be non-zero");
                 (
@@ -754,6 +755,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 .indexes
                 .values()
                 .flatten()
+                .filter(|index| {
+                    index.storage_kind() == crate::schema::IndexStorageKind::PhysicalBTree
+                })
                 .map(|index| {
                     turso_assert!(index.root_page != 0, "index root_page must be non-zero");
                     (
@@ -2011,6 +2015,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             .indexes
                             .values()
                             .flatten()
+                            .filter(|index| {
+                                index.storage_kind()
+                                    == crate::schema::IndexStorageKind::PhysicalBTree
+                            })
                             .filter_map(|index| {
                                 self.mvstore
                                     .try_get_table_id_from_root_page_at(

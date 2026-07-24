@@ -4495,6 +4495,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .indexes
                     .values()
                     .flatten()
+                    .filter(|index| {
+                        index.storage_kind() == crate::schema::IndexStorageKind::PhysicalBTree
+                    })
                     .map(|index| index.root_page),
             )
             .collect::<Vec<_>>();
@@ -4896,6 +4899,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         .indexes
                         .values()
                         .flatten()
+                        .filter(|index| {
+                            index.storage_kind() == crate::schema::IndexStorageKind::PhysicalBTree
+                        })
                         .map(|index| index.root_page),
                 )
         };
@@ -8901,7 +8907,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 let is_virtual_table = row_type == "table"
                                     && sql.is_some_and(crate::util::sql_is_create_virtual_table);
                                 let has_btree = match row_type {
-                                    "index" => true,
+                                    // Logical custom indexes are schema metadata only and keep
+                                    // rootpage zero. Their hidden backing indexes have their own
+                                    // non-zero schema rows and are recovered normally.
+                                    "index" => root_page != 0,
                                     "table" => !is_virtual_table,
                                     _ => false,
                                 };

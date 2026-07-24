@@ -2023,6 +2023,139 @@ fn test_restart_with_trigger_rootpage_zero() {
     }
 }
 
+/// Logical custom indexes keep rootpage zero while their backing indexes remain
+/// independently rooted physical B-trees across MVCC bootstrap and checkpoint.
+#[test]
+fn test_restart_with_logical_custom_index_rootpage_zero() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("custom-index.db");
+    let opts = DatabaseOpts::new().with_index_method(true);
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE vectors(id INTEGER PRIMARY KEY, embedding F32_BLOB(4))")
+        .unwrap();
+    conn.execute("CREATE INDEX vectors_sparse ON vectors USING toy_vector_sparse_ivf (embedding)")
+        .unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.close().unwrap();
+
+    let mut db = MvccTestDbNoConn {
+        db: Some(db),
+        path: Some(path.to_str().unwrap().to_string()),
+        opts,
+        enc_opts: None,
+        _temp_dir: Some(temp_dir),
+    };
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(
+        &conn,
+        "SELECT name, rootpage FROM sqlite_schema \
+         WHERE name LIKE 'vectors_sparse%' ORDER BY name",
+    );
+    assert_eq!(
+        rows.len(),
+        3,
+        "logical and two backing indexes must recover"
+    );
+    assert_eq!(rows[0][0].to_string(), "vectors_sparse");
+    assert_eq!(rows[0][1].as_int().unwrap(), 0);
+    assert!(rows[1][1].as_int().unwrap() > 0);
+    assert!(rows[2][1].as_int().unwrap() > 0);
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.close().unwrap();
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(
+        &conn,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 'vectors_sparse'",
+    );
+    assert_eq!(rows[0][0].as_int().unwrap(), 0);
+}
+
+#[test]
+fn test_persistent_cursor_seam_wraps_hidden_table_and_index_in_mvcc() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE cursor_seam_hidden(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL)")
+        .unwrap();
+    conn.execute("CREATE INDEX cursor_seam_hidden_owner ON cursor_seam_hidden(owner)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO cursor_seam_hidden VALUES (1, 7)")
+        .unwrap();
+
+    let (table, index) = conn.with_schema(crate::MAIN_DB_ID, |schema| {
+        (
+            schema.get_btree_table("cursor_seam_hidden").unwrap(),
+            schema
+                .get_index("cursor_seam_hidden", "cursor_seam_hidden_owner")
+                .unwrap()
+                .clone(),
+        )
+    });
+    let table_cursor = conn
+        .open_persistent_table_cursor(crate::MAIN_DB_ID, table.as_ref(), table.root_page)
+        .unwrap();
+    let mut table_cursor = table_cursor;
+    loop {
+        match table_cursor.rewind().unwrap() {
+            IOResult::Done(()) => break,
+            IOResult::IO(io) => io.wait(conn.db.io.as_ref()).unwrap(),
+        }
+    }
+    let table_record = loop {
+        match table_cursor.record().unwrap() {
+            IOResult::Done(record) => break record.unwrap(),
+            IOResult::IO(io) => io.wait(conn.db.io.as_ref()).unwrap(),
+        }
+    };
+    assert_eq!(table_record.get_value(1).unwrap().as_int(), Some(7));
+    let table_rowid = loop {
+        match table_cursor.rowid().unwrap() {
+            IOResult::Done(rowid) => break rowid.unwrap(),
+            IOResult::IO(io) => io.wait(conn.db.io.as_ref()).unwrap(),
+        }
+    };
+    assert_eq!(table_rowid, 1);
+
+    let index_cursor = conn
+        .open_persistent_index_cursor(crate::MAIN_DB_ID, index.as_ref(), index.root_page)
+        .unwrap();
+    let mut index_cursor = index_cursor;
+    loop {
+        match index_cursor.rewind().unwrap() {
+            IOResult::Done(()) => break,
+            IOResult::IO(io) => io.wait(conn.db.io.as_ref()).unwrap(),
+        }
+    }
+    let index_record = loop {
+        match index_cursor.record().unwrap() {
+            IOResult::Done(record) => break record.unwrap(),
+            IOResult::IO(io) => io.wait(conn.db.io.as_ref()).unwrap(),
+        }
+    };
+    assert_eq!(index_record.get_value(0).unwrap().as_int(), Some(7));
+    assert_eq!(index_record.get_value(1).unwrap().as_int(), Some(1));
+
+    drop(index_cursor);
+    drop(table_cursor);
+    conn.execute("ROLLBACK").unwrap();
+    assert!(get_rows(&conn, "SELECT * FROM cursor_seam_hidden").is_empty());
+}
+
 #[turso_macros::test(encryption)]
 fn test_btree_resident_recovery_then_checkpoint_delete_stays_deleted() {
     let mut db = MvccTestDbNoConn::new_maybe_encrypted(encrypted);

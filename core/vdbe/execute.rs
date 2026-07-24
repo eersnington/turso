@@ -11812,9 +11812,10 @@ pub fn op_index_method_create(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    let mv_store = program.connection.mv_store_for_db(*db);
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
+    if program.connection.mv_store_for_db(*db).is_some() {
+        return Err(LimboError::ParseError(
+            "creating custom indexes is not supported in MVCC mode".to_string(),
+        ));
     }
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if state.cursors[*cursor_id].is_none() {
@@ -11843,9 +11844,10 @@ pub fn op_index_method_destroy(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    let mv_store = program.connection.mv_store_for_db(*db);
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
+    if program.connection.mv_store_for_db(*db).is_some() {
+        return Err(LimboError::ParseError(
+            "dropping custom indexes is not supported in MVCC mode".to_string(),
+        ));
     }
     if let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) {
         if state.cursors[*cursor_id].is_none() {
@@ -11874,9 +11876,10 @@ pub fn op_index_method_optimize(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
-    let mv_store = program.connection.mv_store_for_db(*db);
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
+    if program.connection.mv_store_for_db(*db).is_some() {
+        return Err(LimboError::ParseError(
+            "optimizing custom indexes is not supported in MVCC mode".to_string(),
+        ));
     }
     if let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) {
         if state.cursors[*cursor_id].is_none() {
@@ -11903,7 +11906,7 @@ pub fn op_index_method_query(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         IndexMethodQuery {
-            db: _,
+            db,
             cursor_id,
             start_reg,
             count_reg,
@@ -11911,9 +11914,10 @@ pub fn op_index_method_query(
         },
         insn
     );
-    let mv_store = program.connection.mv_store();
-    if let Some(_mv_store) = mv_store.as_ref() {
-        todo!("MVCC is not supported yet");
+    if program.connection.mv_store_for_db(*db).is_some() {
+        return Err(LimboError::ParseError(
+            "querying custom indexes is not supported in MVCC mode".to_string(),
+        ));
     }
     let cursor = state.cursors[*cursor_id]
         .as_mut()

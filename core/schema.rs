@@ -1785,8 +1785,8 @@ impl Schema {
                 unparsed_sql_from_index.root_page,
                 table.as_ref(),
             )?;
-            if mvcc_enabled && index.index_method.is_some() {
-                crate::bail_parse_error!("Custom index modules are not supported with MVCC");
+            if mvcc_enabled {
+                index.validate_persistent_storage()?;
             }
             self.add_index(Arc::new(index))?;
         }
@@ -5615,6 +5615,12 @@ pub struct Index {
     pub on_conflict: Option<ResolveType>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexStorageKind {
+    LogicalCustom,
+    PhysicalBTree,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct IndexColumn {
@@ -5633,6 +5639,37 @@ pub struct IndexColumn {
 }
 
 impl Index {
+    /// Classifies whether the schema entry owns a physical B-tree. Logical custom
+    /// indexes keep rootpage zero; their backing tables and indexes are separate
+    /// physical schema objects.
+    pub fn storage_kind(&self) -> IndexStorageKind {
+        if self.index_method.is_some() && !self.is_backing_btree_index() {
+            IndexStorageKind::LogicalCustom
+        } else {
+            IndexStorageKind::PhysicalBTree
+        }
+    }
+
+    /// Persistent schema loading calls this to enforce rootpage zero for logical
+    /// custom metadata and a non-zero rootpage for physical B-tree indexes.
+    pub fn validate_persistent_storage(&self) -> Result<()> {
+        match self.storage_kind() {
+            IndexStorageKind::LogicalCustom if self.root_page != 0 => {
+                Err(LimboError::Corrupt(format!(
+                    "logical custom index '{}' must have rootpage 0, got {}",
+                    self.name, self.root_page
+                )))
+            }
+            IndexStorageKind::PhysicalBTree if self.root_page == 0 => {
+                Err(LimboError::Corrupt(format!(
+                    "physical index '{}' must have a non-zero rootpage",
+                    self.name
+                )))
+            }
+            IndexStorageKind::LogicalCustom | IndexStorageKind::PhysicalBTree => Ok(()),
+        }
+    }
+
     pub fn from_sql(
         syms: &SymbolTable,
         sql: &str,
