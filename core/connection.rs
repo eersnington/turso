@@ -3,13 +3,18 @@ use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::statement::StatementOrigin;
-use crate::storage::{journal_mode, pager::SavepointResult};
+use crate::storage::{
+    btree::{BTreeCursor, CursorTrait},
+    journal_mode,
+    pager::SavepointResult,
+};
 use crate::sync::{
     atomic::{
         AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8, Ordering,
     },
     Arc, RwLock,
 };
+use crate::types::IndexInfo;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -26,11 +31,15 @@ use crate::{
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler,
     BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
     Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
-    EncryptionKey, EncryptionOpts, IOResult, IndexMethod, LimboError, MvStore, OpenFlags, PageSize,
-    Pager, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
-    Trigger, Value, VirtualTable, WalAutoActions,
+    EncryptionKey, EncryptionOpts, IOResult, IndexMethod, LimboError, MvCursor, MvStore, OpenFlags,
+    PageSize, Pager, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode,
+    TransactionMode, Trigger, Value, VirtualTable, WalAutoActions,
 };
 use crate::{is_memory_like, turso_assert};
+use crate::{
+    mvcc::cursor::MvccCursorType,
+    schema::{BTreeTable, Index, IndexStorageKind},
+};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -3112,6 +3121,108 @@ impl Connection {
             }
             _ => Ok(self.attached_databases.read().get_pager_by_index(index)),
         }
+    }
+
+    /// Opens a registered schema-owned table cursor through the active WAL or MVCC path.
+    pub(crate) fn open_persistent_table_cursor(
+        self: &Arc<Self>,
+        database_id: usize,
+        table: &BTreeTable,
+        logical_root: i64,
+    ) -> Result<Box<dyn CursorTrait>> {
+        let mv_store = self.mv_store_for_db(database_id);
+        if !table.has_rowid && self.get_mv_tx_id_for_db(database_id).is_some() {
+            return Err(LimboError::ParseError(
+                "WITHOUT ROWID tables are not supported in MVCC mode".to_string(),
+            ));
+        }
+        let physical_root = mv_store
+            .as_ref()
+            .filter(|_| logical_root < 0)
+            .map_or(logical_root, |store| store.get_real_table_id(logical_root));
+        let pager = self.get_pager_from_database_index(&database_id)?;
+        #[allow(unused_mut)]
+        let mut cursor = if table.has_rowid {
+            BTreeCursor::new_table(pager, physical_root, table.columns().len())
+        } else {
+            BTreeCursor::new_without_rowid_table(pager, physical_root, table, table.columns().len())
+        };
+        #[cfg(any(test, injected_yields))]
+        cursor.install_yield_context(self);
+        let cursor: Box<dyn CursorTrait> = Box::new(cursor);
+        let Some(tx_id) = self.get_mv_tx_id_for_db(database_id) else {
+            cursor.register_with_pager();
+            return Ok(cursor);
+        };
+        let mv_store = mv_store.expect("active MVCC transaction must have an MVCC store");
+        let cursor: Box<dyn CursorTrait> = Box::new(MvCursor::new(
+            mv_store,
+            self,
+            tx_id,
+            logical_root,
+            MvccCursorType::Table,
+            cursor,
+        )?);
+        cursor.register_with_pager();
+        Ok(cursor)
+    }
+
+    /// Opens a registered schema-owned index cursor with schema-derived key metadata.
+    pub(crate) fn open_persistent_index_cursor(
+        self: &Arc<Self>,
+        database_id: usize,
+        index: &Index,
+        logical_root: i64,
+    ) -> Result<Box<dyn CursorTrait>> {
+        let mv_store = self.mv_store_for_db(database_id);
+        let index_info = Arc::new(if let Some(store) = mv_store.as_ref() {
+            IndexInfo::new_from_index_in(index, store.allocator())?
+        } else {
+            IndexInfo::new_from_index(index)?
+        });
+        self.open_persistent_index_cursor_with_info(database_id, index, logical_root, index_info)
+    }
+
+    /// Opens a registered index cursor with caller-defined key metadata for custom storage.
+    pub(crate) fn open_persistent_index_cursor_with_info(
+        self: &Arc<Self>,
+        database_id: usize,
+        index: &Index,
+        logical_root: i64,
+        index_info: Arc<IndexInfo>,
+    ) -> Result<Box<dyn CursorTrait>> {
+        if index.storage_kind() != IndexStorageKind::PhysicalBTree {
+            return Err(LimboError::InternalError(format!(
+                "logical custom index '{}' has no persistent B-tree cursor",
+                index.name
+            )));
+        }
+        let mv_store = self.mv_store_for_db(database_id);
+        let physical_root = mv_store
+            .as_ref()
+            .filter(|_| logical_root < 0)
+            .map_or(logical_root, |store| store.get_real_table_id(logical_root));
+        let pager = self.get_pager_from_database_index(&database_id)?;
+        #[allow(unused_mut)]
+        let mut cursor = BTreeCursor::new_index_with_info(pager, physical_root, index_info.clone());
+        #[cfg(any(test, injected_yields))]
+        cursor.install_yield_context(self);
+        let cursor: Box<dyn CursorTrait> = Box::new(cursor);
+        let Some(tx_id) = self.get_mv_tx_id_for_db(database_id) else {
+            cursor.register_with_pager();
+            return Ok(cursor);
+        };
+        let mv_store = mv_store.expect("active MVCC transaction must have an MVCC store");
+        let cursor: Box<dyn CursorTrait> = Box::new(MvCursor::new(
+            mv_store,
+            self,
+            tx_id,
+            logical_root,
+            MvccCursorType::Index(index_info),
+            cursor,
+        )?);
+        cursor.register_with_pager();
+        Ok(cursor)
     }
 
     /// Get the database name for a given database index.

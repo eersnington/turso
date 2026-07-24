@@ -4,8 +4,8 @@ use crate::turso_assert;
 use crate::turso_debug_assert;
 use crate::{
     index_method::{
-        parse_patterns, IndexMethod, IndexMethodAttachment, IndexMethodConfiguration,
-        IndexMethodCursor, IndexMethodDefinition,
+        open_index_cursor, parse_patterns, IndexMethod, IndexMethodAttachment,
+        IndexMethodConfiguration, IndexMethodCursor, IndexMethodDefinition,
     },
     return_if_io,
     schema::IndexColumn,
@@ -1835,7 +1835,7 @@ pub struct FtsCursor {
     shared_directory_cache: Arc<RwLock<Option<CachedFtsDirectory>>>,
     connection: Option<Arc<Connection>>,
     database_id: Option<usize>,
-    fts_dir_cursor: Option<BTreeCursor>,
+    fts_dir_cursor: Option<Box<dyn CursorTrait>>,
     btree_root_page: Option<i64>,
     hybrid_directory: Option<HybridBTreeDirectory>,
     index: Option<Index>,
@@ -1904,34 +1904,23 @@ impl FtsCursor {
         if self.fts_dir_cursor.is_some() {
             return Ok(());
         }
+        if conn.mv_store_for_db(database_id).is_some() {
+            return Err(LimboError::ParseError(
+                "FTS indexes are not supported in MVCC mode".to_string(),
+            ));
+        }
         // Open cursor for the FTS directory index
         // The index stores all 3 columns: (path, chunk_no, bytes) as the key
         // This is similar to how toy_vector_sparse_ivf stores all data in the index
         let index_name = format!("{}_key", self.dir_table_name);
-
-        // Get root page for HybridBTreeDirectory
-        let pager = conn.get_pager_from_database_index(&database_id)?;
-        let scratch = conn
-            .with_schema(database_id, |schema| {
-                schema.get_index(&self.dir_table_name, &index_name).cloned()
-            })
-            .ok_or_else(|| {
-                LimboError::InternalError(format!(
-                    "index {} for table {} not found",
-                    index_name, self.dir_table_name
-                ))
-            })?;
-        let root_page = scratch.root_page;
-
-        self.btree_root_page = Some(root_page);
-
-        let mut cursor = BTreeCursor::new(pager, root_page, 3);
-        cursor.index_info = Some(Arc::new(IndexInfo::new(
+        let cursor = open_index_cursor(
+            conn,
+            database_id,
+            &self.dir_table_name,
+            &index_name,
             [key_info(), key_info(), key_info()],
-            false,
-            3,
-            false,
-        )?));
+        )?;
+        self.btree_root_page = Some(cursor.root_page());
         self.fts_dir_cursor = Some(cursor);
         Ok(())
     }

@@ -5,7 +5,7 @@ use turso_parser::ast;
 
 use crate::{
     schema::IndexColumn,
-    storage::btree::BTreeCursor,
+    storage::btree::CursorTrait,
     types::{IOResult, IndexInfo, KeyInfo},
     vdbe::Register,
     Connection, LimboError, Result, Value,
@@ -173,33 +173,37 @@ pub trait IndexMethodCursor {
 
 /// helper method to open table BTree cursor in the index method implementation
 pub(crate) fn open_table_cursor(
-    connection: &Connection,
+    connection: &Arc<Connection>,
     database_id: usize,
     table: &str,
-) -> Result<BTreeCursor> {
-    let pager = connection.get_pager_from_database_index(&database_id)?;
-    let Some(table) = connection.with_schema(database_id, |schema| schema.get_table(table)) else {
+) -> Result<Box<dyn CursorTrait>> {
+    let table_name = table;
+    let Some(table) = connection.with_schema(database_id, |schema| schema.get_table(table_name))
+    else {
         return Err(LimboError::InternalError(format!(
-            "table {table} not found",
+            "table {table_name} not found",
         )));
     };
-    let cursor = BTreeCursor::new_table(pager, table.get_root_page()?, table.columns().len());
+    let table = table.btree().ok_or_else(|| {
+        LimboError::InternalError(format!("table '{table_name}' is not backed by a B-tree"))
+    })?;
+    let cursor =
+        connection.open_persistent_table_cursor(database_id, table.as_ref(), table.root_page)?;
     Ok(cursor)
 }
 
 /// helper method to open index BTree cursor in the index method implementation
 pub(crate) fn open_index_cursor<I, E>(
-    connection: &Connection,
+    connection: &Arc<Connection>,
     database_id: usize,
     table: &str,
     index: &str,
     keys: I,
-) -> Result<BTreeCursor>
+) -> Result<Box<dyn CursorTrait>>
 where
     I: IntoIterator<Item = KeyInfo, IntoIter = E>,
     E: ExactSizeIterator<Item = KeyInfo>,
 {
-    let pager = connection.get_pager_from_database_index(&database_id)?;
     let Some(scratch) = connection.with_schema(database_id, |schema| {
         schema.get_index(table, index).cloned()
     }) else {
@@ -209,13 +213,19 @@ where
     };
     let keys = keys.into_iter();
     let num_cols = keys.len();
-    let mut cursor = BTreeCursor::new(pager, scratch.root_page, num_cols);
-    cursor.index_info = Some(Arc::new(IndexInfo::new(
-        keys,
-        false,
-        num_cols,
-        scratch.unique,
-    )?));
+    let index_info = Arc::new(
+        if let Some(mv_store) = connection.mv_store_for_db(database_id) {
+            IndexInfo::new_in(keys, false, num_cols, scratch.unique, mv_store.allocator())?
+        } else {
+            IndexInfo::new(keys, false, num_cols, scratch.unique)?
+        },
+    );
+    let cursor = connection.open_persistent_index_cursor_with_info(
+        database_id,
+        scratch.as_ref(),
+        scratch.root_page,
+        index_info,
+    )?;
     Ok(cursor)
 }
 

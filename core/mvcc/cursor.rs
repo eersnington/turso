@@ -2211,6 +2211,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         self.btree_cursor.get_pager()
     }
 
+    fn register_with_pager(&self) {
+        self.btree_cursor.register_with_pager();
+    }
+
     fn get_skip_advance(&self) -> bool {
         todo!()
     }

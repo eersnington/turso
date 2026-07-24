@@ -1126,9 +1126,23 @@ impl BTreeCursor {
         index: &Index,
         num_columns: usize,
     ) -> Result<Self> {
-        let mut cursor = Self::new(pager, root_page, num_columns);
-        cursor.index_info = Some(Arc::new(IndexInfo::new_from_index(index)?));
-        Ok(cursor)
+        let _ = num_columns;
+        Ok(Self::new_index_with_info(
+            pager,
+            root_page,
+            Arc::new(IndexInfo::new_from_index(index)?),
+        ))
+    }
+
+    /// Uses allocator-appropriate metadata prepared by the persistent cursor factory.
+    pub(crate) fn new_index_with_info(
+        pager: Arc<Pager>,
+        root_page: i64,
+        index_info: Arc<IndexInfo>,
+    ) -> Self {
+        let mut cursor = Self::new(pager, root_page, index_info.num_cols);
+        cursor.index_info = Some(index_info);
+        cursor
     }
 
     /// Resets the cached count state so the next `count()` call re-traverses the
@@ -7135,10 +7149,14 @@ impl CursorTrait for BTreeCursor {
     }
 
     fn register_with_pager(&self) {
-        // Store before the push so a panic inside register_cursor still
-        // triggers an (idempotent) unregister via Drop.
-        self.did_register
-            .store(true, crate::sync::atomic::Ordering::Relaxed);
+        // Registration can be requested by both the factory and a runtime Cursor wrapper.
+        // Only the first request owns the matching unregister in Drop.
+        if self
+            .did_register
+            .swap(true, crate::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
         self.pager.register_cursor(self);
     }
 
