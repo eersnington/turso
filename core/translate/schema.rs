@@ -837,7 +837,11 @@ fn validate(
                                     None => 0,
                                 };
                                 let expected = td.user_params().count();
-                                if provided != expected {
+                                let optional_vector_dimensions = td.is_builtin
+                                    && td.name.eq_ignore_ascii_case("vector")
+                                    && provided == 0
+                                    && expected == 1;
+                                if provided != expected && !optional_vector_dimensions {
                                     bail_parse_error!(
                                         "type \"{}\" requires {} parameter(s), got {}",
                                         type_name,

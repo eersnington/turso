@@ -528,6 +528,12 @@ pub(crate) fn emit_type_expr(
                 program
                     .id_register_overrides
                     .insert(param.name.clone(), reg);
+            } else if type_def.is_builtin && type_def.name.eq_ignore_ascii_case("vector") {
+                let reg = program.alloc_register();
+                program.emit_null(reg, None);
+                program
+                    .id_register_overrides
+                    .insert(param.name.clone(), reg);
             }
         }
         Ok(())

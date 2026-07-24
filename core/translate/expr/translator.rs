@@ -846,12 +846,28 @@ pub fn translate_expr(
                     }
                 },
                 Func::Vector(vector_func) => match vector_func {
-                    VectorFunc::Vector | VectorFunc::Vector32 => {
+                    VectorFunc::Vector => {
                         let args = expect_arguments_exact!(args, 1, vector_func);
                         let start_reg = program.alloc_register();
                         translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
 
                         emit_function_call(program, func_ctx, &[start_reg], target_register)?;
+                        Ok(target_register)
+                    }
+                    VectorFunc::Vector32 => {
+                        let args = expect_arguments_max!(args, 2, vector_func);
+                        if args.is_empty() {
+                            crate::bail_parse_error!(
+                                "vector32 function requires at least 1 argument"
+                            );
+                        }
+                        let mut arg_regs = Vec::with_capacity(args.len());
+                        for arg in args {
+                            let reg = program.alloc_register();
+                            translate_expr(program, referenced_tables, arg, reg, resolver)?;
+                            arg_regs.push(reg);
+                        }
+                        emit_function_call(program, func_ctx, &arg_regs, target_register)?;
                         Ok(target_register)
                     }
                     VectorFunc::Vector32Sparse => {

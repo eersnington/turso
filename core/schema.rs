@@ -844,6 +844,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
         "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+        "CREATE TYPE vector(value any, dimensions integer) BASE blob ENCODE vector32(value, dimensions) DECODE vector_extract(value)",
     ];
 
     for sql in type_sqls {
@@ -5952,6 +5953,18 @@ impl Index {
 mod tests {
     use super::*;
     use crate::alloc::vec;
+
+    #[test]
+    fn vector_is_a_builtin_custom_type() -> Result<()> {
+        let schema = Schema::new();
+        let vector = schema
+            .get_type_def_unchecked("vector")
+            .expect("vector type must be registered");
+        assert!(vector.is_builtin);
+        assert_eq!(vector.base(), "blob");
+        assert_eq!(vector.params().len(), 2);
+        Ok(())
+    }
 
     #[test]
     pub fn test_has_rowid_true() -> Result<()> {

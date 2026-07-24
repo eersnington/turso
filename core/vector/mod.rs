@@ -6,6 +6,11 @@ use crate::LimboError;
 use crate::Result;
 use crate::ValueRef;
 
+/// Minimum supported dimension count for dense float32 vectors.
+pub const MIN_DENSE_F32_DIMENSIONS: usize = 1;
+/// Maximum supported dimension count, matching pgvector's `vector` type.
+pub const MAX_DENSE_F32_DIMENSIONS: usize = 16_000;
+
 pub mod operations;
 pub mod vector_types;
 use vector_types::*;
@@ -34,15 +39,54 @@ pub fn parse_vector<'a>(
     }
 }
 
+/// Encodes a dense float32 vector, optionally enforcing an expected dimension.
+/// A NULL value remains NULL; a NULL expected dimension means unconstrained.
 pub fn vector32(args: &[Register]) -> Result<Value> {
-    if args.len() != 1 {
+    if !(1..=2).contains(&args.len()) {
         return Err(LimboError::ConversionError(
-            "vector32 requires exactly one argument".to_string(),
+            "vector32 requires one or two arguments".to_string(),
         ));
     }
     let value = args[0].get_value();
+    if value.as_value_ref().value_type() == ValueType::Null {
+        return Ok(Value::Null);
+    }
     let vector = parse_vector(value, Some(VectorType::Float32Dense))?;
     let vector = operations::convert::vector_convert(vector, VectorType::Float32Dense)?;
+    if vector.dims < MIN_DENSE_F32_DIMENSIONS {
+        return Err(LimboError::ConversionError(
+            "vector must have at least 1 dimension".to_string(),
+        ));
+    }
+    if vector.dims > MAX_DENSE_F32_DIMENSIONS {
+        return Err(LimboError::ConversionError(
+            "vector cannot have more than 16000 dimensions".to_string(),
+        ));
+    }
+    if let Some(expected) = args.get(1) {
+        if expected.get_value().as_value_ref().value_type() == ValueType::Null {
+            return Ok(operations::serialize::vector_serialize(vector)?);
+        }
+        let expected = expected
+            .get_value()
+            .as_value_ref()
+            .as_int()
+            .ok_or_else(|| {
+                LimboError::ConversionError("vector dimensions must be an integer".to_string())
+            })?;
+        if !(MIN_DENSE_F32_DIMENSIONS as i64..=MAX_DENSE_F32_DIMENSIONS as i64).contains(&expected)
+        {
+            return Err(LimboError::ConversionError(format!(
+                "vector dimensions must be between 1 and 16000, got {expected}"
+            )));
+        }
+        if vector.dims != expected as usize {
+            return Err(LimboError::ConversionError(format!(
+                "expected {expected} dimensions, not {}",
+                vector.dims
+            )));
+        }
+    }
     Ok(operations::serialize::vector_serialize(vector)?)
 }
 
@@ -128,6 +172,12 @@ pub fn vector_distance_cos(args: &[Register]) -> Result<Value> {
 
     let value_0 = args[0].get_value();
     let value_1 = args[1].get_value();
+    if [value_0, value_1]
+        .iter()
+        .any(|value| value.as_value_ref().value_type() == ValueType::Null)
+    {
+        return Ok(Value::Null);
+    }
     let x = parse_vector(value_0, None)?;
     let y = parse_vector(value_1, None)?;
     let dist = operations::distance_cos::vector_distance_cos(&x, &y)?;
@@ -143,6 +193,12 @@ pub fn vector_distance_l2(args: &[Register]) -> Result<Value> {
 
     let value_0 = args[0].get_value();
     let value_1 = args[1].get_value();
+    if [value_0, value_1]
+        .iter()
+        .any(|value| value.as_value_ref().value_type() == ValueType::Null)
+    {
+        return Ok(Value::Null);
+    }
     let x = parse_vector(value_0, None)?;
     let y = parse_vector(value_1, None)?;
     let dist = operations::distance_l2::vector_distance_l2(&x, &y)?;
@@ -158,6 +214,12 @@ pub fn vector_distance_jaccard(args: &[Register]) -> Result<Value> {
 
     let value_0 = args[0].get_value();
     let value_1 = args[1].get_value();
+    if [value_0, value_1]
+        .iter()
+        .any(|value| value.as_value_ref().value_type() == ValueType::Null)
+    {
+        return Ok(Value::Null);
+    }
     let x = parse_vector(value_0, None)?;
     let y = parse_vector(value_1, None)?;
     let dist = operations::jaccard::vector_distance_jaccard(&x, &y)?;
@@ -173,6 +235,12 @@ pub fn vector_distance_dot(args: &[Register]) -> Result<Value> {
 
     let value_0 = args[0].get_value();
     let value_1 = args[1].get_value();
+    if [value_0, value_1]
+        .iter()
+        .any(|value| value.as_value_ref().value_type() == ValueType::Null)
+    {
+        return Ok(Value::Null);
+    }
     let x = parse_vector(value_0, None)?;
     let y = parse_vector(value_1, None)?;
     let dist = operations::distance_dot::vector_distance_dot(&x, &y)?;

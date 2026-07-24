@@ -366,12 +366,12 @@ impl VectorFunc {
     pub fn arities(&self) -> &'static [i32] {
         match self {
             Self::Vector
-            | Self::Vector32
             | Self::Vector32Sparse
             | Self::Vector64
             | Self::Vector8
             | Self::Vector1Bit
             | Self::VectorExtract => &[1],
+            Self::Vector32 => &[1, 2],
             Self::VectorDistanceCos
             | Self::VectorDistanceL2
             | Self::VectorDistanceJaccard
